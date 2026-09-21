@@ -36,7 +36,7 @@ Watchtower continuously monitors **authorized** targets for security-relevant ch
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                          Cloudflare Worker                                │
+│                          Cloudflare Worker                               │
 │                                                                          │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐            │
 │  │ Telegram │    │ REST API │    │ Cron     │    │ Queue    │            │
@@ -45,26 +45,26 @@ Watchtower continuously monitors **authorized** targets for security-relevant ch
 │       │               │               │               │                  │
 │       └───────────────┴───────────────┴───────────────┘                  │
 │                            │                                             │
-│                  ┌─────────┴─────────┐                                  │
+│                  ┌─────────┴─────────┐                                   │
 │                  │  Scope Engine     │  (SSRF + redirect + redaction)    │
-│                  │  + Audit Logger   │                                  │
-│                  └─────────┬─────────┘                                  │
+│                  │  + Audit Logger   │                                   │
+│                  └─────────┬─────────┘                                   │
 │                            │                                             │
-│   ┌────────────┬──────────┴──────────┬─────────────┐                   │
-│   │            │                     │             │                    │
-│  D1           R2                   KV        Durable Objects           │
-│ (metadata)   (evidence)        (cache)   (locks/rate/estop)            │
+│    ┌────────────┬──────────┴──────────┬─────────────┐                    │
+│    │            │                     │             │                    │
+│   D1           R2                   KV        Durable Objects            │
+│  (metadata)   (evidence)        (cache)   (locks/rate/estop)             │
 │                                                                          │
-│   ┌────────────┬──────────┬───────────┬───────────┬───────────┐       │
-│   │ crt.sh     │ Cert     │ DNS-over- │ HTTP      │ OSV        │       │
-│   │            │ Spotter  │ HTTPS     │ (Worker)  │            │       │
-│   └────────────┴──────────┴───────────┴───────────┴───────────┘       │
+│   ┌────────────┬──────────┬───────────┬───────────┬───────────┐          │
+│   │ crt.sh     │ Cert     │ DNS-over- │ HTTP      │ OSV       │          │
+│   │            │ Spotter  │ HTTPS     │ (Worker)  │           │          │
+│   └────────────┴──────────┴───────────┴───────────┴───────────┘          │
 │                                                                          │
-│   Scanner-runner protocol (HMAC-signed jobs):                           │
-│     nmap | subfinder | amass | httpx | nuclei | zap | burp              │
-│   ─────────────────────────────────────────────────────                 │
+│   Scanner-runner protocol (HMAC-signed jobs):                            │
+│     nmap | subfinder | amass | httpx | nuclei | zap | burp               │
+│   ─────────────────────────────────────────────────────                  │
 │                       ↓ external runner                                  │
-│   container / Cloud Run / Fly.io / Lambda / GitHub Actions              │
+│   container / Cloud Run / Fly.io / Lambda / GitHub Actions               │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
