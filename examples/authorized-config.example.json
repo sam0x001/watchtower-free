@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "title": "Watchtower authorized target configuration",
+  "description": "Example authorized test configuration. Used to bootstrap a target with full scope, program rules, and scan profile.",
+  "type": "object",
+  "required": ["organization", "target", "scope", "authorization"],
+  "properties": {
+    "organization": {
+      "type": "object",
+      "required": ["id", "name", "slug"],
+      "properties": {
+        "id": { "type": "string", "example": "ORG_acme" },
+        "name": { "type": "string", "example": "Acme Corp" },
+        "slug": { "type": "string", "example": "acme" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["name", "passive_only", "low_impact_active", "intrusive_enabled", "max_request_rate_per_min", "max_concurrent_jobs", "authorization_expires_at"],
+      "properties": {
+        "name": { "type": "string", "example": "example.com" },
+        "passive_only": { "type": "boolean", "example": true },
+        "low_impact_active": { "type": "boolean", "example": false, "description": "When true, the bot may run low-impact active checks (HTTP probing, JS analysis). When false, only passive recon (CT, DNS) is permitted." },
+        "intrusive_enabled": { "type": "boolean", "example": false, "description": "Always false by default. Enabling requires human approval per action." },
+        "max_request_rate_per_min": { "type": "integer", "minimum": 1, "maximum": 1000, "example": 60 },
+        "max_concurrent_jobs": { "type": "integer", "minimum": 1, "maximum": 5, "example": 3 },
+        "program_rules_url": { "type": ["string", "null"], "example": "https://bugbounty.example.com/rules" },
+        "authorization_expires_at": { "type": "string", "format": "date-time", "example": "2099-12-31T23:59:59Z" }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "required": ["reference", "type", "verified_by"],
+      "properties": {
+        "reference": { "type": "string", "example": "WRITTEN-CONTRACT-2026-001" },
+        "type": { "type": "string", "enum": ["written_contract", "bug_bounty_program", "internal_authorization", "penetration_test_authorization"] },
+        "verified_by": { "type": "string", "example": "USR_owner" },
+        "document_url": { "type": ["string", "null"], "example": "https://docs.example.com/contracts/2026-001.pdf" }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "required": ["includes", "excludes"],
+      "properties": {
+        "includes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type", "value"],
+            "properties": {
+              "type": { "type": "string", "enum": ["domain", "wildcard_domain", "ip", "cidr", "url", "api", "repository", "cloud_account", "mobile_app"] },
+              "value": { "type": "string" },
+              "notes": { "type": ["string", "null"] }
+            }
+          },
+          "example": [
+            { "type": "wildcard_domain", "value": "*.example.com" },
+            { "type": "domain", "value": "example.com" }
+          ]
+        },
+        "excludes": {
+          "type": "array",
+          "items": { "$ref": "#/properties/scope/properties/includes/items" },
+          "example": [
+            { "type": "domain", "value": "internal.example.com", "notes": "Production billing — do not probe" }
+          ]
+        },
+        "included_ports": { "type": "array", "items": { "type": "integer" }, "example": [80, 443] },
+        "excluded_ports": { "type": "array", "items": { "type": "integer" }, "example": [22, 3389] },
+        "included_paths": { "type": "array", "items": { "type": "string" }, "example": ["/api/", "/static/"] },
+        "excluded_paths": { "type": "array", "items": { "type": "string" }, "example": ["/admin/billing/"] }
+      }
+    },
+    "scan_profile": {
+      "type": "string",
+      "enum": [
+        "passive-only",
+        "low-impact-web-content",
+        "low-impact-api-discovery",
+        "javascript-monitoring",
+        "subdomain-monitoring",
+        "technology-specific",
+        "custom-authorized",
+        "full-approved-monitoring"
+      ],
+      "default": "passive-only"
+    },
+    "schedules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["cron_expr", "profile"],
+        "properties": {
+          "cron_expr": { "type": "string", "example": "0 * * * *" },
+          "profile": { "type": "string", "example": "passive-only" }
+        }
+      },
+      "default": [
+        { "cron_expr": "0 * * * *", "profile": "passive-only" },
+        { "cron_expr": "0 0 * * *", "profile": "javascript-monitoring" }
+      ]
+    }
+  }
+}

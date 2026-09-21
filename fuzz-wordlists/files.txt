@@ -1,0 +1,28 @@
+# Common files
+# Disabled by default
+.env
+.env.local
+.env.production
+.gitignore
+.git/config
+.htaccess
+.npmrc
+.package.json
+composer.json
+composer.lock
+Dockerfile
+docker-compose.yml
+Gemfile
+Gemfile.lock
+Makefile
+package-lock.json
+package.json
+phpinfo.php
+php.ini
+Procfile
+requirements.txt
+robots.txt
+security.txt
+sitemap.xml
+webpack.config.js
+yarn.lock

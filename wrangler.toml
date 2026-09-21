@@ -1,0 +1,115 @@
+name = "watchtower"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+send_metrics = false
+
+# ---------------------------------------------------------------------------
+# FREE TIER configuration
+#
+# This wrangler.toml is designed to run on Cloudflare Workers FREE plan:
+#   - NO Queues (async work via ctx.waitUntil + D1 job_queue table)
+#   - NO Durable Objects (replaced with D1 row state)
+#   - 1 Cron Trigger (free-tier limit) — 5-min interval with internal dispatch
+#   - 10ms CPU per invocation (work runs in waitUntil)
+#   - 100k Worker requests/day (sufficient for 5-min cron + occasional msgs)
+#   - D1: 5M reads + 100k writes/day, 5 GB storage
+#   - R2: 10 GB storage, 1M+10M operations/month
+#   - KV: 100k reads + 1k writes/day
+# ---------------------------------------------------------------------------
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+invocation_logs = true
+
+# ---------------------------------------------------------------------------
+# Static configuration (non-secret)
+# ---------------------------------------------------------------------------
+[vars]
+WATCHTOWER_ENV = "production"
+MAX_RESPONSE_BYTES = "1048576"            # 1 MiB (down from 5 MiB paid tier)
+MAX_JS_FILE_BYTES = "524288"               # 512 KiB per JS file
+MAX_JS_FILES_PER_ASSET = "20"              # down from 200
+MAX_CERTIFICATE_RESULTS = "500"            # down from 2000
+MAX_WORDLIST_ENTRIES = "5000"              # down from 50000
+MAX_WORDLIST_WORD_LENGTH = "256"
+DEFAULT_REQUEST_TIMEOUT_MS = "8000"        # 8s per request (down from 15s)
+MAX_JOBS_PER_TARGET = "1"                  # strictly serial (free tier)
+GLOBAL_RATE_LIMIT_PER_MINUTE = "30"       # down from 120
+TELEGRAM_UPDATE_MAX_BYTES = "65536"
+REQUIRE_HUMAN_APPROVAL_DEFAULT = "true"
+PASSIVE_ONLY_DEFAULT = "true"
+INTRUSIVE_TESTING_ENABLED = "false"
+WORDLIST_MODULE_ENABLED = "false"
+EVIDENCE_RETENTION_DAYS = "90"             # down from 365
+JS_SNAPSHOT_RETENTION_DAYS = "30"          # down from 180
+AUDIT_RETENTION_DAYS = "90"                # down from 730
+ALERT_BATCH_LOW_SEVERITY = "true"
+USER_AGENT = "Watchtower/3.0-free (+authorized-security-monitoring)"
+SCOPE_EXPIRY_WARNING_DAYS = "7"
+# Free-tier CPU/job bounds
+FREE_TIER_MAX_CPU_MS = "10"                # free-tier hard ceiling per invocation
+FREE_TIER_MAX_JOBS_PER_CRON = "2"          # only 2 scan jobs + 10 notification jobs per cron
+FREE_TIER_SCAN_TIMEOUT_MS = "60000"        # 60s wall-clock per scan job
+
+# ---------------------------------------------------------------------------
+# D1 — relational metadata + job_queue + findings + audit logs (FREE: 5 GB)
+# ---------------------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "watchtower-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# ---------------------------------------------------------------------------
+# R2 — encrypted evidence + reports (FREE: 10 GB)
+# ---------------------------------------------------------------------------
+[[r2_buckets]]
+binding = "EVIDENCE"
+bucket_name = "watchtower-evidence"
+
+[[r2_buckets]]
+binding = "REPORTS"
+bucket_name = "watchtower-reports"
+
+# ---------------------------------------------------------------------------
+# KV — non-critical cache only (FREE: 100k reads + 1k writes/day)
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "CACHE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# ---------------------------------------------------------------------------
+# SINGLE Cron Trigger — free tier allows only 1 per worker.
+# Internal handler in src/cron/handler.ts dispatches based on time-of-day.
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["*/5 * * * *"]  # every 5 minutes
+
+# ---------------------------------------------------------------------------
+# Secrets — set via `wrangler secret put <NAME>` (NEVER in this file)
+# ---------------------------------------------------------------------------
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_WEBHOOK_SECRET
+# AUTHORIZED_TELEGRAM_IDS (comma-separated allowlist during bootstrap)
+# API_HMAC_KEY
+# ENCRYPTION_KEY (32 bytes base64 — for AES-GCM at-rest encryption)
+# REDACTION_SALT (32 bytes hex — used to salt secret fingerprints)
+# WEBHOOK_SIGNING_SECRET
+# RUNNER_REGISTRY_TOKEN
+
+# ---------------------------------------------------------------------------
+# Dev overrides (local `wrangler dev`)
+# ---------------------------------------------------------------------------
+[env.dev]
+name = "watchtower-dev"
+workers_dev = true
+
+[env.dev.vars]
+WATCHTOWER_ENV = "dev"
+FREE_TIER_MAX_JOBS_PER_CRON = "1"

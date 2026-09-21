@@ -1,0 +1,28 @@
+# Common directories
+# Disabled by default — see /src/modules/wordlist.ts
+admin
+api
+api/v1
+api/v2
+api/v3
+assets
+backup
+backups
+config
+dashboard
+debug
+docs
+internal
+login
+logout
+old
+private
+public
+static
+status
+test
+tmp
+v1
+v2
+webhooks
+well-known

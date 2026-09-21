@@ -1,0 +1,11 @@
+# Dev secrets (used by `wrangler dev`) — DO NOT COMMIT REAL VALUES
+# Copy this file to `.dev.vars` and replace placeholders.
+
+TELEGRAM_BOT_TOKEN="replace-me"
+TELEGRAM_WEBHOOK_SECRET="replace-me"
+AUTHORIZED_TELEGRAM_IDS="111111111"
+ENCRYPTION_KEY="base64:replace-me-with-32-bytes"
+REDACTION_SALT="replace-me-with-32-bytes-hex"
+API_HMAC_KEY="replace-me"
+WEBHOOK_SIGNING_SECRET="replace-me"
+RUNNER_REGISTRY_TOKEN="replace-me"
