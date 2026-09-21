@@ -516,6 +516,9 @@ runner:
 
 Any attempt to inject shell metacharacters or unsupported flags is rejected.
 
+## Diagram
+![Diagram](./img/diagram.png)
+
 ## License
 
 Apache-2.0
