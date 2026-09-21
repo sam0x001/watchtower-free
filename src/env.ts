@@ -19,9 +19,13 @@
 export interface Env {
   // ---- Cloudflare bindings ----------------------------------------------
   DB: D1Database;
-  EVIDENCE: R2Bucket;
-  REPORTS: R2Bucket;
   CACHE: KVNamespace;
+
+  // ---- Optional R2 bindings (not required on free tier) -----------------
+  // If set, evidence + reports will be stored in R2. If not set, they fall
+  // back to D1 BLOB storage (see src/evidence/d1-storage.ts).
+  EVIDENCE?: R2Bucket;
+  REPORTS?: R2Bucket;
 
   // ---- Secrets ----------------------------------------------------------
   TELEGRAM_BOT_TOKEN: string;

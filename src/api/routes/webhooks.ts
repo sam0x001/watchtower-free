@@ -29,22 +29,45 @@ export async function handleRunnerCallback(ctx: RouteContext): Promise<Response>
   const stdout = body.stdout_b64 ? atob(body.stdout_b64) : "";
   const { redacted } = redactSync(stdout);
 
-  // Persist raw (redacted) output as evidence
+  // Persist raw (redacted) output as evidence.
+  // Uses R2 if bound, otherwise falls back to D1 evidence_blobs.
   const evidenceId = randomId("ev", 16);
   const r2Key = `evidence/runner/${body.job_id}/${evidenceId}`;
-  await ctx.env.EVIDENCE.put(r2Key, JSON.stringify({
+  const evidenceContent = JSON.stringify({
     tool: body.tool,
     exit_code: body.exit_code,
     duration_seconds: body.duration_seconds,
     stdout_redacted: redacted,
     artifacts: body.artifacts,
-  }), {
-    customMetadata: {
-      "job-id": body.job_id,
-      "tool": body.tool,
-      "created-at": body.timestamp,
-    },
   });
+
+  if (ctx.env.EVIDENCE) {
+    await ctx.env.EVIDENCE.put(r2Key, evidenceContent, {
+      customMetadata: {
+        "job-id": body.job_id,
+        "tool": body.tool,
+        "created-at": body.timestamp,
+      },
+    });
+  } else {
+    // D1 fallback — store as encrypted blob.
+    const { encryptString } = await import("../../crypto/encryption.js");
+    const encrypted = await encryptString(evidenceContent, ctx.env.ENCRYPTION_KEY);
+    const { sha256 } = await import("../../crypto/hash.js");
+    const evidenceHash = await sha256(evidenceContent);
+    await ctx.env.DB
+      .prepare(`INSERT INTO evidence_blobs (id, r2_key, organization_id, target_id, finding_id, evidence_type, evidence_hash, encrypted_blob, redacted, description, created_at, accessed_at, access_count, expires_at) VALUES (?, ?, ?, ?, NULL, 'scanner_output', ?, ?, 1, ?, ?, NULL, 0, ?)`)
+      .bind(
+        evidenceId, r2Key,
+        (await ctx.env.DB.prepare(`SELECT organization_id FROM targets WHERE id = ?`).bind(job.target_id).first<{ organization_id: string }>())?.organization_id ?? "",
+        job.target_id,
+        evidenceHash, encrypted,
+        `Runner output for job ${body.job_id}`,
+        new Date().toISOString(),
+        new Date(Date.now() + 90 * 86_400_000).toISOString(),  // 90-day retention
+      )
+      .run();
+  }
 
   await ctx.env.DB
     .prepare(`INSERT INTO scan_results (id, scan_id, asset_id, tool, result_type, payload_json, evidence_key, created_at) VALUES (?, ?, NULL, ?, 'raw_output', ?, ?, ?)`)

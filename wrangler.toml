@@ -57,7 +57,8 @@ FREE_TIER_MAX_JOBS_PER_CRON = "2"          # only 2 scan jobs + 10 notification 
 FREE_TIER_SCAN_TIMEOUT_MS = "60000"        # 60s wall-clock per scan job
 
 # ---------------------------------------------------------------------------
-# D1 — relational metadata + job_queue + findings + audit logs (FREE: 5 GB)
+# D1 — relational metadata + job_queue + findings + audit logs + evidence
+# (FREE: 5 GB, no payment method required)
 # ---------------------------------------------------------------------------
 [[d1_databases]]
 binding = "DB"
@@ -66,15 +67,26 @@ database_id = "REPLACE_WITH_D1_DATABASE_ID"
 migrations_dir = "migrations"
 
 # ---------------------------------------------------------------------------
-# R2 — encrypted evidence + reports (FREE: 10 GB)
+# R2 — OPTIONAL on the free tier.
+#
+# R2's free tier (10 GB storage) is technically $0/month but Cloudflare
+# requires a payment method on file to enable R2 at all. If you don't want
+# to add a card, leave these commented out and Watchtower will store
+# encrypted evidence + reports as TEXT in the D1 database instead.
+#
+# To use R2 (recommended if you have a payment method on file):
+#   1. Enable R2 in the Cloudflare dashboard
+#   2. Uncomment the blocks below
+#   3. Run: wrangler r2 bucket create watchtower-evidence
+#          wrangler r2 bucket create watchtower-reports
 # ---------------------------------------------------------------------------
-[[r2_buckets]]
-binding = "EVIDENCE"
-bucket_name = "watchtower-evidence"
-
-[[r2_buckets]]
-binding = "REPORTS"
-bucket_name = "watchtower-reports"
+# [[r2_buckets]]
+# binding = "EVIDENCE"
+# bucket_name = "watchtower-evidence"
+#
+# [[r2_buckets]]
+# binding = "REPORTS"
+# bucket_name = "watchtower-reports"
 
 # ---------------------------------------------------------------------------
 # KV — non-critical cache only (FREE: 100k reads + 1k writes/day)

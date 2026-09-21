@@ -193,10 +193,29 @@ async function downloadEvidenceHandler(ctx: RouteContext): Promise<Response> {
   if (expectedSig !== sig) return jsonError(ctx.requestId, "invalid_signature", "Bad signature", 401);
   if (new Date(expires).getTime() < Date.now()) return jsonError(ctx.requestId, "expired", "URL expired", 401);
 
-  const obj = await ctx.env.EVIDENCE.get(key);
-  if (!obj) return jsonError(ctx.requestId, "not_found", "Evidence not found", 404);
-  const body = await obj.text();
-  return new Response(body, { headers: { "content-type": "application/octet-stream", "x-evidence-key": key } });
+  // Try R2 first if bound, otherwise fall back to D1 evidence_blobs.
+  if (ctx.env.EVIDENCE) {
+    const obj = await ctx.env.EVIDENCE.get(key);
+    if (!obj) return jsonError(ctx.requestId, "not_found", "Evidence not found", 404);
+    const body = await obj.text();
+    return new Response(body, { headers: { "content-type": "application/octet-stream", "x-evidence-key": key } });
+  }
+
+  // D1 fallback: retrieve + decrypt the evidence blob.
+  const row = await ctx.env.DB
+    .prepare(`SELECT encrypted_blob FROM evidence_blobs WHERE r2_key = ?`)
+    .bind(key)
+    .first<{ encrypted_blob: string }>();
+  if (!row) return jsonError(ctx.requestId, "not_found", "Evidence not found", 404);
+  // Update access tracking
+  await ctx.env.DB
+    .prepare(`UPDATE evidence_blobs SET accessed_at = ?, access_count = access_count + 1 WHERE r2_key = ?`)
+    .bind(new Date().toISOString(), key)
+    .run()
+    .catch(() => undefined);
+  return new Response(row.encrypted_blob, {
+    headers: { "content-type": "application/octet-stream", "x-evidence-key": key },
+  });
 }
 
 async function hmacSign(key: string, msg: string): Promise<string> {

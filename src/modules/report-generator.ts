@@ -36,15 +36,36 @@ export async function generateReport(env: Env, inputs: ReportInputs): Promise<Ge
   const contentHash = await sha256(redacted);
   const r2Key = `reports/${inputs.target.organization_id}/${inputs.target.id}/${id}.${inputs.format === "json" ? "json" : "md"}`;
 
-  await env.EVIDENCE.put(r2Key, redacted, {
-    customMetadata: {
-      "report-id": id,
-      "target-id": inputs.target.id,
-      "format": inputs.format,
-      "content-hash": contentHash,
-      "generated-at": new Date().toISOString(),
-    },
-  });
+  // Use R2 if bound, otherwise fall back to D1 evidence_blobs.
+  if (env.EVIDENCE) {
+    await env.EVIDENCE.put(r2Key, redacted, {
+      customMetadata: {
+        "report-id": id,
+        "target-id": inputs.target.id,
+        "format": inputs.format,
+        "content-hash": contentHash,
+        "generated-at": new Date().toISOString(),
+      },
+    });
+  } else {
+    // D1 fallback — store the report content as an encrypted evidence blob.
+    const { encryptString } = await import("../crypto/encryption.js");
+    const encrypted = await encryptString(redacted, env.ENCRYPTION_KEY);
+    await env.DB
+      .prepare(`INSERT INTO evidence_blobs (id, r2_key, organization_id, target_id, finding_id, evidence_type, evidence_hash, encrypted_blob, redacted, description, created_at, accessed_at, access_count, expires_at) VALUES (?, ?, ?, ?, NULL, 'scanner_output', ?, ?, 0, ?, ?, NULL, 0, ?)`)
+      .bind(
+        `rep_${id}`,
+        r2Key,
+        inputs.target.organization_id,
+        inputs.target.id,
+        contentHash,
+        encrypted,
+        `Report ${inputs.format} for target ${inputs.target.id}`,
+        new Date().toISOString(),
+        new Date(Date.now() + 365 * 86_400_000).toISOString(),  // 1-year retention for reports
+      )
+      .run();
+  }
 
   await env.DB
     .prepare(`UPDATE reports SET r2_key = ?, findings_count = ?, scope_json = ? WHERE id = ?`)

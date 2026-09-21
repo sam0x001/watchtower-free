@@ -36,7 +36,7 @@ Watchtower continuously monitors **authorized** targets for security-relevant ch
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                          Cloudflare Worker                               │
+│                          Cloudflare Worker                                │
 │                                                                          │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐            │
 │  │ Telegram │    │ REST API │    │ Cron     │    │ Queue    │            │
@@ -45,26 +45,26 @@ Watchtower continuously monitors **authorized** targets for security-relevant ch
 │       │               │               │               │                  │
 │       └───────────────┴───────────────┴───────────────┘                  │
 │                            │                                             │
-│                  ┌─────────┴─────────┐                                   │
+│                  ┌─────────┴─────────┐                                  │
 │                  │  Scope Engine     │  (SSRF + redirect + redaction)    │
-│                  │  + Audit Logger   │                                   │
-│                  └─────────┬─────────┘                                   │
+│                  │  + Audit Logger   │                                  │
+│                  └─────────┬─────────┘                                  │
 │                            │                                             │
-│    ┌────────────┬──────────┴──────────┬─────────────┐                    │
-│    │            │                     │             │                    │
-│   D1           R2                   KV        Durable Objects            │
-│  (metadata)   (evidence)        (cache)   (locks/rate/estop)             │
+│   ┌────────────┬──────────┴──────────┬─────────────┐                   │
+│   │            │                     │             │                    │
+│  D1           R2                   KV        Durable Objects           │
+│ (metadata)   (evidence)        (cache)   (locks/rate/estop)            │
 │                                                                          │
-│   ┌────────────┬──────────┬───────────┬───────────┬───────────┐          │
-│   │ crt.sh     │ Cert     │ DNS-over- │ HTTP      │ OSV       │          │
-│   │            │ Spotter  │ HTTPS     │ (Worker)  │           │          │
-│   └────────────┴──────────┴───────────┴───────────┴───────────┘          │
+│   ┌────────────┬──────────┬───────────┬───────────┬───────────┐       │
+│   │ crt.sh     │ Cert     │ DNS-over- │ HTTP      │ OSV        │       │
+│   │            │ Spotter  │ HTTPS     │ (Worker)  │            │       │
+│   └────────────┴──────────┴───────────┴───────────┴───────────┘       │
 │                                                                          │
-│   Scanner-runner protocol (HMAC-signed jobs):                            │
-│     nmap | subfinder | amass | httpx | nuclei | zap | burp               │
-│   ─────────────────────────────────────────────────────                  │
+│   Scanner-runner protocol (HMAC-signed jobs):                           │
+│     nmap | subfinder | amass | httpx | nuclei | zap | burp              │
+│   ─────────────────────────────────────────────────────                 │
 │                       ↓ external runner                                  │
-│   container / Cloud Run / Fly.io / Lambda / GitHub Actions               │
+│   container / Cloud Run / Fly.io / Lambda / GitHub Actions              │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -163,13 +163,16 @@ npm install
 cp .env.example .dev.vars
 # Edit .dev.vars with bot token, webhook secret, encryption key, HMAC key, REDACTION_SALT
 
-# 3. Create D1 database + KV namespace + R2 buckets (FREE TIER — no queues, no DOs)
+# 3. Create D1 database + KV namespace (FREE TIER — no R2, no queues, no DOs)
+#    R2 is OPTIONAL on the free tier — requires payment method on file.
+#    Watchtower automatically falls back to D1 BLOB storage when R2 is not bound.
 npx wrangler d1 create watchtower-db
 npx wrangler kv:namespace create CACHE
-npx wrangler r2 bucket create watchtower-evidence
-npx wrangler r2 bucket create watchtower-reports
+# Optional (only if you have a payment method on file):
+#   npx wrangler r2 bucket create watchtower-evidence
+#   npx wrangler r2 bucket create watchtower-reports
 
-# 4. Apply DB migrations (11 incremental files — 0001..0010 + seed)
+# 4. Apply DB migrations (12 incremental files — 0001..0011 + seed)
 npx wrangler d1 migrations apply watchtower-db --remote
 
 # 5. Set secrets

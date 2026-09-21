@@ -125,7 +125,13 @@ export async function handleScheduled(
   if (minuteOfDay % 60 === 0) {
     const purgedJobs = await purgeOldJobs(env.DB, 7);
     const purgedAudit = await purgeOldAuditLogs(env, num(env.AUDIT_RETENTION_DAYS, 730));
-    log_.info("cron.purge_complete", { purgedJobs, purgedAudit });
+    // Also purge expired evidence blobs (D1 fallback for R2).
+    const { purgeExpiredEvidence } = await import("../evidence/d1-storage.js");
+    const purgedEvidence = await purgeExpiredEvidence(env).catch((err) => {
+      log_.warn("cron.purge_evidence_failed", { err: String(err) });
+      return 0;
+    });
+    log_.info("cron.purge_complete", { purgedJobs, purgedAudit, purgedEvidence });
   }
 
   log_.info("cron.tick_complete", {
