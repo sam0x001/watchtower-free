@@ -153,8 +153,10 @@ watchtower/
 └── wrangler.toml
 ```
 
-## Quick start
+## Deployment
+Full deployment and debugging guide is available in [DEPLOYMENT.md](./DEPLOYMENT.md), use it as main reference!
 
+### Quick start
 ```bash
 # 1. Install
 npm install
