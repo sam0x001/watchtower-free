@@ -74,9 +74,33 @@ npx wrangler d1 migrations apply watchtower-db --local
 npx wrangler d1 migrations apply watchtower-db --remote
 ```
 
-This applies 12 incremental migration files (`0001_initial.sql` through
-`0011_evidence_d1.sql`) plus the seed file. The last migration creates
-the `evidence_blobs` table that replaces R2 for evidence storage.
+This applies the incremental migration files (`0001_initial.sql` through
+`0012_audit_logs_reconcile.sql`) plus the seed file. `0011_evidence_d1.sql`
+creates the `evidence_blobs` table that replaces R2 for evidence storage, and
+`0012_audit_logs_reconcile.sql` restores `audit_logs` to its canonical column
+set (see below).
+
+### Never change the schema by hand
+
+**Always change the schema with a migration file in `migrations/` — never with
+`npx wrangler d1 execute --command "ALTER TABLE ..."`.** Hand-run DDL is
+invisible to git, invisible to `wrangler d1 migrations list`, and invisible to
+everyone else deploying this repo. It is exactly how the `audit_logs` incident
+happened: extra columns were added straight to the remote database, the Worker
+kept writing only those columns, and every audit insert started failing with
+`NOT NULL constraint failed: audit_logs.actor_kind`.
+
+`audit_logs` is the canary, because it is written on every Telegram command,
+scan, API call and webhook, and it is the only table with `NOT NULL` actor
+columns. If a deploy starts throwing database errors, check for schema drift
+first — the local and remote column lists must match exactly:
+
+```bash
+npx wrangler d1 execute watchtower-db --local  --command "PRAGMA table_info(audit_logs);"
+npx wrangler d1 execute watchtower-db --remote --command "PRAGMA table_info(audit_logs);"
+```
+
+If they differ, see the Troubleshooting section below before deploying again.
 
 ## Step 5 — Generate strong secrets
 
@@ -278,12 +302,13 @@ picks it up.
 
 ## Observability
 
-- Workers logs: `npx wrangler tail`
+- Workers logs: `npx wrangler tail` — live stream of the deployed Worker's
+  console output (see [Debugging a live Worker](#debugging-a-live-worker-with-npx-wrangler-tail))
 - D1 queries: `npx wrangler d1 execute watchtower-db --remote --command "..."`
 - Audit log:
   ```bash
   npx wrangler d1 execute watchtower-db --remote --command \
-    "SELECT timestamp, action, telegram_id, result, error FROM audit_logs ORDER BY timestamp DESC LIMIT 20;"
+    "SELECT created_at, command, actor_identity, result, result_detail FROM audit_logs ORDER BY created_at DESC LIMIT 20;"
   ```
 - Job queue:
   ```bash
@@ -295,6 +320,121 @@ picks it up.
   npx wrangler d1 execute watchtower-db --remote --command \
     "SELECT id, channel, severity, status, last_error, created_at FROM notifications ORDER BY created_at DESC LIMIT 20;"
   ```
+
+## Debugging a live Worker with `npx wrangler tail`
+
+`npx wrangler tail` opens a live stream of everything your **deployed** Worker
+logs: every `console.log` / `warn` / `error`, every uncaught exception, and every
+cron invocation. It is the fastest way to find out *why* the bot replied
+"❌ Command failed" — the terminal shows the real error string, which never
+reaches Telegram.
+
+```bash
+npx wrangler tail                  # stream all invocations
+npx wrangler tail --status error   # only invocations that threw
+npx wrangler tail --format json    # machine-readable, one JSON object per line
+```
+
+Leave it running in one terminal while you exercise the bot from another
+(Telegram, `curl`, the dashboard). Telegram never needs to retry anything:
+Watchtower acks the webhook immediately and does the work in `ctx.waitUntil()`,
+so log lines appear just *after* the webhook returns `200`.
+
+A single request looks like this (Wrangler's default `pretty` format):
+
+```
+POST https://watchtower.<subdomain>.workers.dev/telegram?secret=... - Ok @ 9/21/2026, 2:31:12 PM
+  (error) {"level":"error","msg":"telegram.process_update.failed","err":"Error: D1_ERROR: NOT NULL constraint failed: audit_logs.actor_kind: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_NOTNULL)","requestId":"req_TAcO0eiXf0g7"}
+```
+
+### Filtering the stream
+
+| Flag | Use it for |
+|---|---|
+| `--status error` | only failed invocations — the one you want while debugging |
+| `--format json` | piping into `jq` (`jq 'select(.level=="error")'`) or unreadable colour output |
+| `--search "<text>"` | substring match in a log message, e.g. `--search requestId` |
+| `--method POST` | isolate `/telegram` webhook traffic (always `POST`) |
+| `--method GET` | isolate `/v1/*` reads from your own tooling |
+| `--header "cf-connecting-ip: 203.0.113.7"` | a single client's requests |
+| `--ip self` | only requests you make yourself (health checks, `curl /v1/*`) |
+| `--sampling-rate 0.5` | sample 50% of invocations on a busy Worker |
+| `--version-id <id>` | confirm which deployed version is actually serving traffic |
+
+Ctrl+C ends the session. Nothing is stored afterwards by `tail` itself, but
+because `[observability]` is enabled in `wrangler.toml` the same entries are
+also browsable in the Cloudflare dashboard (Workers → watchtower → Logs).
+
+On Windows PowerShell, quote patterns that contain `$`, `{` or spaces:
+`npx wrangler tail --search 'requestId'`.
+
+### Reading Watchtower's logs
+
+Every line is a JSON object emitted by `src/audit/logger.ts`
+(`makeConsoleLogger`), so it always carries `level` (`debug`/`info`/`warn`/`error`)
+and `msg`, usually plus context fields. The names worth grepping for:
+
+| Message | Level | Meaning |
+|---|---|---|
+| `telegram.process_update.failed` | error | the whole Telegram update failed — `err` holds the real cause, `requestId` ties it to `audit_logs.correlation_id` |
+| `telegram.command.<command>.failed` | error | one handler (`/scan`, `/audit`, …) threw; the sender also saw `❌ Command failed: …` |
+| `api.route_error` | error | an `/v1/*` handler threw; `path` and `requestId` are included |
+| `webhook.blocked_private_target` | warn | SSRF protection rejected a private/reserved host |
+| `cron.tick_complete` | info | a cron tick finished (fields: `time`, `notifications`, `scans`, `scansEnqueued`, `expiredTargets`, `warningTargets`) |
+| `cron.run_scans_failed`, `cron.dispatch_notifications_failed` | warn | that stage of the tick failed; the tick still completes |
+| `cron.stale_jobs_expire_failed`, `cron.purge_evidence_failed` | warn | cleanup stage failed (fine once, investigate if it repeats) |
+| `slack.disabled_no_token`, `jira.disabled_no_token`, `github.disabled_no_config`, `email.disabled_no_config` | warn | that integration simply isn't configured |
+
+### Debug workflow
+
+1. Start `npx wrangler tail --status error` in one terminal.
+2. Reproduce the problem — send the command to the bot, or hit the Worker.
+3. Read the `err` field, then note the `requestId`.
+4. Correlate the failure with the audit trail:
+
+   ```bash
+   npx wrangler d1 execute watchtower-db --remote --command \
+     "SELECT created_at, command, actor_kind, result, result_detail, correlation_id FROM audit_logs ORDER BY created_at DESC LIMIT 10;"
+   ```
+
+5. No matching audit row at all? Then the request died *before* the audit write:
+   a wrong `?secret=`, a body that isn't JSON (`400 Bad Request`), or a failed
+   D1 insert. Check `npx wrangler tail --method POST`, and the webhook status:
+
+   ```bash
+   curl "https://api.telegram.org/bot<your-bot-token>/getWebhookInfo" | jq
+   ```
+
+6. Cron problems never show an HTTP request line. Run
+   `npx wrangler tail --format json --status error` and look for `cron.*`
+   entries; a healthy tick reports `cron.tick_complete`, so compare against a
+   working one before hunting further.
+7. Fix, `npx wrangler deploy`, repeat the action and confirm the error is gone —
+   `tail` keeps streaming across deploys, so you can watch the same Worker
+   through the whole fix.
+
+### Debugging locally instead of in production
+
+`npx wrangler dev` prints the same JSON lines to your terminal but uses the
+**local** D1 database (`.wrangler/state/`), so you can iterate without touching
+production data or spamming your real chat:
+
+```bash
+npx wrangler d1 migrations apply watchtower-db --local   # once, or after pulling new migrations
+npx wrangler dev
+```
+
+Then replay an update against the local Worker (secrets come from `.dev.vars`,
+see `.dev.vars.example`):
+
+```bash
+curl -X POST "http://localhost:8787/telegram?secret=$TELEGRAM_WEBHOOK_SECRET" \
+  -H "content-type: application/json" \
+  -d '{"update_id":1,"message":{"message_id":1,"chat":{"id":123,"type":"private"},"from":{"id":123,"is_bot":false,"username":"you"},"text":"/help","date":0}}'
+```
+
+**Keep tokens out of committed files.** `.dev.vars` and `.env` are gitignored;
+put secrets in shell variables or `.dev.vars`, never in a `.sh` you might commit.
 
 ## Backups
 
@@ -309,6 +449,22 @@ git pull
 npx wrangler d1 migrations apply watchtower-db --remote
 npx wrangler deploy
 ```
+
+Migrations in this repo are additive, so migrating before deploying is normally
+safe. The exception is a migration that **removes or renames** columns the
+currently deployed Worker still writes — for example
+`0012_audit_logs_reconcile.sql`, which drops leftover `audit_logs` columns. For
+those, deploy first and migrate second:
+
+```bash
+git pull
+npx wrangler deploy                                     # code that only uses current columns
+npx wrangler d1 migrations apply watchtower-db --remote  # then change the schema
+```
+
+`./scripts/deploy.sh` follows this order (deploy, then migrate) for exactly this
+reason. Keep `npx wrangler tail --status error` open while you update — it is the
+only way to catch a bad release before your users do.
 
 ## Troubleshooting
 
@@ -327,6 +483,63 @@ in `wrangler.toml`.
 
 Same as above — make sure you're using `watchtower-free.zip`. The free version
 uses a D1 `job_queue` table instead of Cloudflare Queues.
+
+### D1_ERROR: NOT NULL constraint failed: audit_logs.actor_kind
+
+Full symptom in `npx wrangler tail`:
+
+```
+(error) {"level":"error","msg":"telegram.process_update.failed","err":"Error: D1_ERROR: NOT NULL constraint failed: audit_logs.actor_kind: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_NOTNULL)"}
+```
+
+`audit_logs` has `NOT NULL` columns (`actor_kind`, `command`, `result`,
+`created_at`), so the Worker must supply all of them on every insert. This error
+means the database and the deployed code disagree about the table's columns —
+almost always because the remote schema was modified by hand instead of through
+a migration file. The mirror-image symptom is
+`D1_ERROR: no such column: audit_logs.request_id`.
+
+Diagnose (the two column lists must match exactly):
+
+```bash
+npx wrangler d1 execute watchtower-db --local  --command "PRAGMA table_info(audit_logs);"
+npx wrangler d1 execute watchtower-db --remote --command "PRAGMA table_info(audit_logs);"
+```
+
+Repair:
+
+1. `git pull` so you have a release whose Worker writes the canonical columns,
+   then deploy it: `npx wrangler deploy`.
+2. Apply every migration, including the reconciling one:
+   `npx wrangler d1 migrations apply watchtower-db --remote`.
+   `0012_audit_logs_reconcile.sql` rebuilds `audit_logs` with exactly the
+   canonical columns, so any hand-added columns disappear.
+3. Re-run `PRAGMA table_info(audit_logs)` — you should see 19 columns, ending in
+   `correlation_id`, `created_at`.
+4. Trigger a command in Telegram with `npx wrangler tail --status error` open —
+   no more `NOT NULL` errors.
+
+**Order matters here:** deploy the code *before* a migration that removes
+columns the running Worker still writes, otherwise the live Worker fails with
+`no such column` in the window between the two commands. Purely additive
+migrations are safe in either order (see Updating below).
+
+### "incomplete input: SQLITE_ERROR" from `wrangler d1 execute`
+
+`--command` takes a single statement, and newlines inside the argument get
+mangled — D1 then sees a truncated query:
+
+```
+✘ [ERROR] A request to the Cloudflare API (/accounts/.../d1/database/.../query) failed.
+  incomplete input: SQLITE_ERROR [code: 7500]
+```
+
+Keep `--command` to one-liners (`--command "SELECT COUNT(*) FROM audit_logs;"`)
+and put anything longer or multi-statement in a file (create it first):
+
+```bash
+npx wrangler d1 execute watchtower-db --remote --file=query.sql
+```
 
 ### Bot doesn't respond to `/start`
 

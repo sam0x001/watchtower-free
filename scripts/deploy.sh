@@ -9,15 +9,7 @@ WRANGLER="npx wrangler"
 
 echo "==> Deploying Watchtower to ${ENV}"
 
-# 1. Apply DB migrations
-echo "==> Applying D1 migrations..."
-if [[ "$ENV" == "production" ]]; then
-  $WRANGLER d1 migrations apply watchtower-db --remote
-else
-  $WRANGLER d1 migrations apply watchtower-db --local
-fi
-
-# 2. Verify required secrets are set
+# 1. Verify required secrets are set
 echo "==> Verifying required secrets..."
 REQUIRED_SECRETS=(
   TELEGRAM_BOT_TOKEN
@@ -39,12 +31,24 @@ if [[ "$ENV" == "production" ]]; then
   done
 fi
 
-# 3. Deploy the Worker
+# 2. Deploy the Worker
 echo "==> Deploying Worker..."
 if [[ "$ENV" == "production" ]]; then
   $WRANGLER deploy
 else
   $WRANGLER deploy --env "$ENV"
+fi
+
+# 3. Apply DB migrations
+# Deliberately AFTER the deploy: a migration that removes or renames columns
+# (e.g. migrations/0012_audit_logs_reconcile.sql, which drops the leftover
+# audit_logs columns) must not run while the previous Worker version — which
+# still writes those columns — is serving traffic.
+echo "==> Applying D1 migrations..."
+if [[ "$ENV" == "production" ]]; then
+  $WRANGLER d1 migrations apply watchtower-db --remote
+else
+  $WRANGLER d1 migrations apply watchtower-db --local
 fi
 
 echo "==> Done."

@@ -358,6 +358,9 @@ export interface ReportMessage {
 
 export type QueueMessage = ScanMessage | NotificationMessage | ReportMessage;
 
+/** Actor classification stored in `audit_logs.actor_kind` (see migrations/0001_initial.sql). */
+export type AuditActorKind = "telegram" | "api" | "system" | "runner" | "webhook";
+
 export interface AuditEvent {
   timestamp: string;
   user_id: string | null;
@@ -369,10 +372,25 @@ export interface AuditEvent {
   job_id: string | null;
   scanner: string | null;
   args_redacted: string;
-  result: "success" | "failure" | "blocked" | "denied";
+  /**
+   * In-memory result vocabulary. The audit_logs table stores a narrower set
+   * ('success' | 'denied' | 'error' | 'pending_approval'): the logger maps
+   * "failure" -> "error" and "blocked" -> "denied" when writing.
+   */
+  result: "success" | "failure" | "blocked" | "denied" | "pending_approval";
   error: string | null;
   ip: string | null;
   request_id: string;
+  /**
+   * Who performed the action. Optional — when omitted the logger infers the
+   * kind from the action prefix / presence of a telegram id. It is never
+   * omitted in the INSERT because `audit_logs.actor_kind` is NOT NULL.
+   */
+  actor_kind?: AuditActorKind;
+  /** Raw actor identifier (Telegram id, user id, runner id...). Defaults to telegram_id/user_id. */
+  actor_identity?: string | null;
+  /** Runner id, when the action was performed by (or on behalf of) a runner. */
+  runner_id?: string | null;
 }
 
 export interface RunnerRegistration {

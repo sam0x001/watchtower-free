@@ -38,7 +38,7 @@ Invoke this procedure when any of the following occur:
    - Which findings were generated?
    - Which notifications were sent?
 2. Pull the audit log for the affected time window:
-   `SELECT * FROM audit_logs WHERE timestamp > ? ORDER BY timestamp DESC LIMIT 1000`.
+   `SELECT * FROM audit_logs WHERE created_at > ? ORDER BY created_at DESC LIMIT 1000`.
 3. Snapshot the D1 database: `wrangler d1 export watchtower-db --remote > snapshot.sql`.
 4. Snapshot R2 evidence: list objects under `evidence/` for the affected orgs.
 

@@ -63,7 +63,7 @@ FREE_TIER_SCAN_TIMEOUT_MS = "60000"        # 60s wall-clock per scan job
 [[d1_databases]]
 binding = "DB"
 database_name = "watchtower-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = ""
 migrations_dir = "migrations"
 
 # ---------------------------------------------------------------------------
@@ -93,8 +93,8 @@ migrations_dir = "migrations"
 # ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "CACHE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = ""
+preview_id = ""
 
 # ---------------------------------------------------------------------------
 # SINGLE Cron Trigger — free tier allows only 1 per worker.

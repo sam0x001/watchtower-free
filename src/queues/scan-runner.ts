@@ -15,6 +15,7 @@
 //   - Any job that throws is marked failed + retried up to max_attempts
 
 import type { Env } from "../env.js";
+import type { AuditActorKind } from "../types.js";
 import { getTargetById, listScopeEntries } from "../db/queries/targets.js";
 import { compileScope, isScopeExpired, checkHostInScope } from "../security/scope.js";
 import { EmergencyStopClient } from "../db/emergency-stop.js";
@@ -247,10 +248,17 @@ async function processScanJob(
       alerts.push(...jsResult.alerts);
     }
 
+    // Scans are enqueued by the cron handler or by a /scan command — keep the
+    // audit actor in sync with whatever created the job.
+    const triggeredBy = (job.payload["triggered_by"] as string | null) ?? "cron";
+    const actorKind: AuditActorKind =
+      triggeredBy === "telegram" ? "telegram" : triggeredBy === "api" ? "api" : "system";
+
     await audit.log({
       timestamp: new Date().toISOString(),
       user_id: triggeredByUserId,
       telegram_id: null,
+      actor_kind: actorKind,
       organization_id: target.organization_id,
       action: "scan.completed",
       target_id: targetId,

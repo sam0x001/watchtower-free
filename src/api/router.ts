@@ -77,6 +77,7 @@ export async function routeApi(request: Request, env: Env, _ctx: ExecutionContex
         timestamp: new Date().toISOString(),
         user_id: userId,
         telegram_id: null,
+        actor_kind: "api",
         organization_id: orgId,
         action: `api.${request.method}.${url.pathname}`,
         target_id: null,
@@ -94,7 +95,7 @@ export async function routeApi(request: Request, env: Env, _ctx: ExecutionContex
       log.error("api.route_error", { path: url.pathname, err: String(err), requestId });
       await audit.log({
         timestamp: new Date().toISOString(),
-        user_id: userId, telegram_id: null, organization_id: orgId,
+        user_id: userId, telegram_id: null, actor_kind: "api", organization_id: orgId,
         action: `api.${request.method}.${url.pathname}`,
         target_id: null, scope_id: null, job_id: null, scanner: null,
         args_redacted: "{}",

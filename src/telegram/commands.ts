@@ -358,9 +358,9 @@ const handlers: Record<string, CommandHandler> = {
     const action = args[1];
     const where: string[] = ["organization_id = ?"];
     const binds: (string | number)[] = [orgId];
-    if (action) { where.push("action = ?"); binds.push(action); }
-    const rows = await env.DB.prepare(`SELECT timestamp, action, telegram_id, result, error FROM audit_logs WHERE ${where.join(" AND ")} ORDER BY timestamp DESC LIMIT 20`).bind(...binds).all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `${r["timestamp"]} ${r["action"]} ${r["telegram_id"] ?? ""} → ${r["result"]}${r["error"] ? " (" + r["error"] + ")" : ""}`);
+    if (action) { where.push("command = ?"); binds.push(action); }
+    const rows = await env.DB.prepare(`SELECT created_at, command, actor_identity, result, result_detail FROM audit_logs WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT 20`).bind(...binds).all<Record<string, unknown>>();
+    const lines = (rows.results ?? []).map((r) => `${r["created_at"]} ${r["command"]} ${r["actor_identity"] ?? ""} → ${r["result"]}${r["result_detail"] ? " (" + r["result_detail"] + ")" : ""}`);
     await sendMessage(env, ctx.chatId, lines.length ? `📋 Audit:\n\n${lines.join("\n")}` : "No audit records.");
   },
   stop: async (env, ctx, args) => {

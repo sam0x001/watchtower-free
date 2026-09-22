@@ -12,3 +12,6 @@ coverage/
 .idea/
 *.zip
 watchtower-*.tgz
+
+# local helper scripts that contain live secrets (bot tokens, webhook secrets)
+scripts/webhook-tester.sh

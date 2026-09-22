@@ -17,7 +17,7 @@ import type { Env } from "../env.js";
 import { EmergencyStopClient } from "../db/emergency-stop.js";
 import { isScopeExpired, scopeExpiringSoon } from "../security/scope.js";
 import { num } from "../env.js";
-import { SCOPE_EXPIRY_WARNING_DAYS } from "../constants.js";
+import { LIMITS } from "../constants.js";
 import { log } from "../audit/logger.js";
 import { sendMessage } from "../telegram/webhook.js";
 import { randomId } from "../crypto/hash.js";
@@ -25,6 +25,8 @@ import { enqueueJob, purgeOldJobs } from "../db/job-queue.js";
 import { runPendingScans } from "../queues/scan-runner.js";
 import { dispatchPendingNotifications } from "../queues/notification-dispatcher.js";
 import { listAuditLogs } from "../db/queries/audit.js";
+
+const SCOPE_EXPIRY_WARNING_DAYS = LIMITS.SCOPE_EXPIRY_WARNING_DAYS;
 
 export async function handleScheduled(
   controller: ScheduledController,
@@ -158,7 +160,7 @@ async function autoExpireStaleJobs(db: D1Database, now: Date): Promise<void> {
 async function purgeOldAuditLogs(env: Env, retentionDays: number): Promise<number> {
   const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
   const result = await env.DB
-    .prepare(`DELETE FROM audit_logs WHERE timestamp < ?`)
+    .prepare(`DELETE FROM audit_logs WHERE created_at < ?`)
     .bind(cutoff)
     .run();
   return result.meta?.changes ?? 0;
