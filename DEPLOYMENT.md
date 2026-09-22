@@ -167,7 +167,7 @@ Note the URL — you'll need it in step 8.
 
 ## Step 8 — Register the Telegram webhook
 
-Replace the placeholders and run:
+Replace the placeholders and run [webhook-tester.sh](./scripts/webhook-tester.sh) which is in `scripts/webhook-tester.sh`:
 
 ```bash
 WEBHOOK_URL="https://watchtower.YOUR-SUBDOMAIN.workers.dev"
