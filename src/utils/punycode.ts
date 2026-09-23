@@ -69,7 +69,7 @@ export function punycodeEncode(input: string): string {
           q = Math.floor((q - t) / (PUNY_BASE - t));
         }
         output += digitToChar(q);
-        bias = adapt(delta, h + 1, h === basicHandled);
+        bias = adapt(delta, h + 1, h === basicCount);
         delta = 0;
         h++;
       }

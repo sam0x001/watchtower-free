@@ -7,7 +7,7 @@ import { log } from "../audit/logger.js";
 export async function sendEmail(env: Env, msg: NotificationMessage): Promise<boolean> {
   if (!env.SENDGRID_API_KEY || !env.SENDGRID_FROM) { log.warn("email.disabled_no_config", {}); return false; }
   const integration = await env.DB
-    .prepare(`SELECT config_json FROM integrations WHERE organization_id = ? AND type = 'email' AND enabled = 1`)
+    .prepare(`SELECT config_json FROM integrations WHERE organization_id = ? AND kind = 'email' AND enabled = 1`)
     .bind(msg.organization_id)
     .first<{ config_json: string }>();
   if (!integration) return false;

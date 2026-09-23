@@ -17,9 +17,8 @@ export {
   parseAsset,
   isBlockedIp,
   isWildcardTooBroad,
-  loadScopeSnapshot,
-  assertInScope,
 } from "../scope/index.js";
+export { loadScopeSnapshot, assertInScope } from "./loader-shim.js";
 
 export type {
   CompiledScope,

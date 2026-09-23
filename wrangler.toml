@@ -53,7 +53,8 @@ USER_AGENT = "Watchtower/3.0-free (+authorized-security-monitoring)"
 SCOPE_EXPIRY_WARNING_DAYS = "7"
 # Free-tier CPU/job bounds
 FREE_TIER_MAX_CPU_MS = "10"                # free-tier hard ceiling per invocation
-FREE_TIER_MAX_JOBS_PER_CRON = "2"          # only 2 scan jobs + 10 notification jobs per cron
+FREE_TIER_MAX_JOBS_PER_CRON = "2"          # scan jobs per cron
+FREE_TIER_MAX_NOTIFICATIONS_PER_CRON = "10" # notification jobs per cron
 FREE_TIER_SCAN_TIMEOUT_MS = "60000"        # 60s wall-clock per scan job
 
 # ---------------------------------------------------------------------------

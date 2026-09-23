@@ -7,7 +7,7 @@ import { log } from "../audit/logger.js";
 export async function sendJira(env: Env, msg: NotificationMessage): Promise<boolean> {
   if (!env.JIRA_API_TOKEN || !env.JIRA_BASE_URL) { log.warn("jira.disabled_no_token", {}); return false; }
   const integration = await env.DB
-    .prepare(`SELECT config_json FROM integrations WHERE organization_id = ? AND type = 'jira' AND enabled = 1`)
+    .prepare(`SELECT config_json FROM integrations WHERE organization_id = ? AND kind = 'jira' AND enabled = 1`)
     .bind(msg.organization_id)
     .first<{ config_json: string }>();
   if (!integration) return false;

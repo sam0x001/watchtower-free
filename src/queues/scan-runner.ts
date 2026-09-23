@@ -40,6 +40,59 @@ import type { Alert } from "../modules/alerts.js";
 import { buildAlert } from "../modules/alerts.js";
 import { num } from "../env.js";
 
+/**
+ * Mirror the job_queue lifecycle onto the canonical `scans` row.
+ *
+ * A scan is tracked in two places: the `job_queue` row the dispatcher claims,
+ * and the `scans` row created by /scan_passive (status 'queued'). Only the
+ * former was ever advanced, so /scan_status and /scan_history reported every
+ * scan as "queued" forever, even after the work had finished.
+ *
+ * Jobs enqueued by the cron handler use a synthetic scan id and have no
+ * `scans` row, so the UPDATE simply matches zero rows for them.
+ */
+async function updateScanRow(
+  db: D1Database,
+  scanId: string | undefined,
+  status: "queued" | "running" | "completed" | "failed",
+  opts: { stop_reason?: string | null; errors?: string[]; reset_started?: boolean } = {},
+): Promise<void> {
+  if (!scanId) return;
+  const now = new Date().toISOString();
+  const sets = ["status = ?", "updated_at = ?"];
+  const binds: (string | null)[] = [status, now];
+
+  if (status === "running") {
+    sets.push("started_at = ?");
+    binds.push(now);
+  }
+  if (opts.reset_started) {
+    sets.push("started_at = NULL");
+  }
+  if (status === "completed" || status === "failed") {
+    sets.push("finished_at = ?");
+    binds.push(now);
+  }
+  if (opts.stop_reason !== undefined) {
+    sets.push("stop_reason = ?");
+    binds.push(opts.stop_reason ?? null);
+  }
+  if (opts.errors && opts.errors.length > 0) {
+    sets.push("errors_json = ?");
+    binds.push(JSON.stringify(opts.errors.slice(0, 20)));
+  }
+  binds.push(scanId);
+
+  // Never resurrect a scan the operator already terminated (cancel / estop).
+  await db
+    .prepare(
+      `UPDATE scans SET ${sets.join(", ")} WHERE id = ? ` +
+      `AND status NOT IN ('cancelled','stopped','scope_denied')`,
+    )
+    .bind(...binds)
+    .run();
+}
+
 export async function runPendingScans(
   env: Env,
   ctx: ExecutionContext,
@@ -55,9 +108,11 @@ export async function runPendingScans(
   let alertsEnqueued = 0;
 
   for (const job of jobs) {
+    const scanId = job.payload["job_id"] as string | undefined;
     const result = await processScanJob(env, job, audit, log, scanTimeoutMs);
     if (result.ok) {
       await completeJob(env.DB, job.id, { summary: `${result.alerts} alerts` });
+      await updateScanRow(env.DB, scanId, "completed");
       for (const alert of result.alertsArray) {
         await enqueueJob(env.DB, "notification", {
           organization_id: result.organizationId,
@@ -84,6 +139,14 @@ export async function runPendingScans(
         retry_after_seconds: 60 * (job.attempts + 1),
       });
       failed++;
+      // Only surface a terminal failure on the scan row; a retryable failure
+      // goes back to 'queued' so the next tick can pick it up again.
+      const terminal = job.attempts >= job.max_attempts;
+      await updateScanRow(env.DB, scanId, terminal ? "failed" : "queued", {
+        stop_reason: terminal ? (result.error ?? "unknown error") : null,
+        errors: terminal ? [result.error ?? "unknown error"] : undefined,
+        reset_started: !terminal,
+      });
       await enqueueJob(env.DB, "notification", {
         organization_id: result.organizationId,
         target_id: result.targetId,
@@ -140,6 +203,9 @@ async function processScanJob(
   }
 
   try {
+    // The scan is now genuinely running — reflect that on the canonical row.
+    await updateScanRow(env.DB, job.payload["job_id"] as string | undefined, "running");
+
     const alerts: Alert[] = [];
     const host = target.name;
 
@@ -150,9 +216,9 @@ async function processScanJob(
     // 5. For each in-scope subdomain, run HTTP probe + JS analysis
     //    Limited to first 5 assets per scan to respect CPU budget.
     const assets = await env.DB
-      .prepare(`SELECT id, value, normalized FROM assets WHERE target_id = ? AND type = 'subdomain' AND scope_status = 'in_scope' ORDER BY last_seen DESC LIMIT 5`)
+      .prepare(`SELECT id, identifier, display_name FROM assets WHERE target_id = ? AND asset_type = 'subdomain' AND scope_state = 'allowed' ORDER BY last_seen DESC LIMIT 5`)
       .bind(targetId)
-      .all<{ id: string; value: string; normalized: string }>();
+      .all<{ id: string; identifier: string; display_name: string }>();
 
     const httpx = new HttpxProvider();
     const providerCtx = {
@@ -163,7 +229,8 @@ async function processScanJob(
       log: (m: string, f?: Record<string, unknown>) => log.info(m, f),
     };
 
-    for (const a of assets.results ?? []) {
+    for (const _a of assets.results ?? []) {
+      const a = { id: _a.id, normalized: _a.identifier, value: _a.display_name };
       const scopeCheck = checkHostInScope(scope, a.normalized);
       if (!scopeCheck.allowed) continue;
 

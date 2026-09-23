@@ -68,14 +68,14 @@ export async function generateReport(env: Env, inputs: ReportInputs): Promise<Ge
   }
 
   await env.DB
-    .prepare(`UPDATE reports SET r2_key = ?, findings_count = ?, scope_json = ? WHERE id = ?`)
-    .bind(r2Key, inputs.findings.length, JSON.stringify({ scope: inputs.scopeText }), id)
+    .prepare(`UPDATE reports SET r2_key = ?, size_bytes = ?, methodology = ? WHERE id = ?`)
+    .bind(r2Key, redacted.length, inputs.methodology, id)
     .run()
     .catch(() => undefined);
 
   await env.DB
-    .prepare(`INSERT INTO reports (id, organization_id, target_id, format, scope_json, findings_count, r2_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, inputs.target.organization_id, inputs.target.id, inputs.format, JSON.stringify({ scope: inputs.scopeText }), inputs.findings.length, r2Key, new Date().toISOString())
+    .prepare(`INSERT INTO reports (id, report_ref, organization_id, target_id, report_type, format, title, status, r2_key, content_hash, size_bytes, finding_ids, methodology, limitations, created_at, updated_at) VALUES (?, ?, ?, ?, 'technical_appendix', ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, id, inputs.target.organization_id, inputs.target.id, inputs.format, `Report for ${inputs.target.name}`, r2Key, contentHash, redacted.length, JSON.stringify(inputs.findings.map((f) => f.id)), inputs.methodology, JSON.stringify(inputs.limitations), new Date().toISOString(), new Date().toISOString())
     .run()
     .catch(() => undefined);
 

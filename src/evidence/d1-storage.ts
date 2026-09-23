@@ -74,8 +74,8 @@ export async function storeEvidence(env: Env, opts: StoreEvidenceOpts): Promise<
   // consumers that join on that table keep working.
   if (opts.findingId) {
     await env.DB
-      .prepare(`INSERT INTO finding_evidence (id, finding_id, evidence_key, evidence_type, evidence_hash, redacted, description, created_at, access_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`)
-      .bind(id, opts.findingId, r2Key, opts.evidenceType, evidenceHash, opts.redacted === false ? 0 : 1, opts.description ?? "", now.toISOString())
+      .prepare(`INSERT INTO finding_evidence (id, organization_id, target_id, finding_id, evidence_type, r2_key, content_hash, encrypted, encryption_alg, key_version, size_bytes, redacted, captured_by, capture_method, captured_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'AES-256-GCM', 'v1', 0, ?, 'worker', 'd1-storage', ?, ?)`)
+      .bind(id, opts.organizationId, opts.targetId, opts.findingId ?? null, opts.evidenceType, r2Key, evidenceHash, opts.redacted === false ? 0 : 1, now.toISOString(), now.toISOString())
       .run();
   }
 
@@ -110,7 +110,7 @@ export async function retrieveEvidence(
     .bind(new Date().toISOString(), r2Key)
     .run();
   await env.DB
-    .prepare(`UPDATE finding_evidence SET accessed_at = ?, access_count = access_count + 1 WHERE evidence_key = ?`)
+    .prepare(`UPDATE finding_evidence SET verified_at = ? WHERE r2_key = ?`)
     .bind(new Date().toISOString(), r2Key)
     .run()
     .catch(() => undefined);
@@ -163,7 +163,7 @@ export async function listEvidence(env: Env, opts: EvidenceListOpts): Promise<{ 
   const offset = Math.max(0, opts.offset ?? 0);
   if (opts.findingId) {
     const rows = await env.DB
-      .prepare(`SELECT id, evidence_key, evidence_type, evidence_hash, created_at FROM finding_evidence WHERE finding_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+      .prepare(`SELECT id, r2_key, evidence_type, content_hash AS evidence_hash, created_at FROM finding_evidence WHERE finding_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`)
       .bind(opts.findingId, limit, offset)
       .all<Record<string, unknown>>();
     return (rows.results ?? []).map(rowToEvidence);
@@ -193,7 +193,7 @@ export async function purgeExpiredEvidence(env: Env): Promise<number> {
     .run();
   // Also clean up finding_evidence rows whose evidence_blobs row was purged.
   await env.DB
-    .prepare(`DELETE FROM finding_evidence WHERE evidence_key NOT IN (SELECT r2_key FROM evidence_blobs)`)
+    .prepare(`DELETE FROM finding_evidence WHERE r2_key NOT IN (SELECT r2_key FROM evidence_blobs)`)
     .run()
     .catch(() => undefined);
   return result.meta?.changes ?? 0;

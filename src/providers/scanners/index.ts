@@ -32,8 +32,8 @@ async function dispatchToRunner(opts: ScannerRunnerOpts, tool: string, args: Rec
   const signed = await signJobPayload(payload, opts.env.API_HMAC_KEY);
   // Persist the job for the runner to fetch
   await opts.env.DB
-    .prepare(`INSERT INTO scan_jobs (id, scan_id, target_id, tool, args_json, status, attempt, created_at) VALUES (?, ?, ?, ?, ?, 'queued', 0, ?)`)
-    .bind(signed.job_id, opts.scanJobId, opts.targetId, tool, JSON.stringify(args), new Date().toISOString())
+    .prepare(`INSERT INTO scan_jobs (id, organization_id, target_id, scan_id, job_type, adapter, runner_required, priority, status, attempt, max_attempts, payload, payload_hash, requested_targets, scheduled_for, timeout_at, result_summary, created_at, updated_at) VALUES (?, (SELECT organization_id FROM targets WHERE id = ?), ?, ?, 'scan', ?, 1, 5, 'queued', 0, 3, ?, ?, '[]', ?, ?, '{}', ?, ?)`)
+    .bind(signed.job_id, opts.targetId, opts.targetId, opts.scanJobId, tool, JSON.stringify(args), await sha256(JSON.stringify(args)), new Date().toISOString(), new Date(Date.now() + 3600000).toISOString(), new Date().toISOString(), new Date().toISOString())
     .run();
   return { job_id: signed.job_id, runner_url: `runner://pending/${signed.job_id}` };
 }

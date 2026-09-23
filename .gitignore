@@ -11,7 +11,12 @@ coverage/
 .vscode/
 .idea/
 *.zip
+.freebuff
 watchtower-*.tgz
 
-# local helper scripts that contain live secrets (bot tokens, webhook secrets)
-scripts/webhook-tester.sh
+d1-err.txt
+d1-out.txt
+jq-err.txt
+jq-out.txt
+tmp-check-jobs.sql
+tmp-fix2.cjs

@@ -72,7 +72,8 @@ export interface Env {
   SCOPE_EXPIRY_WARNING_DAYS: string;
   // Free-tier overrides
   FREE_TIER_MAX_CPU_MS: string;        // hard ceiling — must be < 10ms on free
-  FREE_TIER_MAX_JOBS_PER_CRON: string; // batch size for each cron invocation
+  FREE_TIER_MAX_JOBS_PER_CRON: string; // scan batch size for each cron invocation
+  FREE_TIER_MAX_NOTIFICATIONS_PER_CRON: string; // notification batch size per cron
   FREE_TIER_SCAN_TIMEOUT_MS: string;   // abort scans that exceed this
 }
 

@@ -5,18 +5,20 @@ import type { Finding } from "../../types.js";
 export async function insertFinding(db: D1Database, f: Finding): Promise<void> {
   await db
     .prepare(`INSERT INTO findings (
-      id, organization_id, target_id, asset_id, type, title, summary,
-      technical_description, business_impact, severity, cvss_score, cvss_vector,
-      epss_score, cwe, cve, owasp_category, affected_url,
+      id, finding_ref, organization_id, target_id, asset_id,
+      finding_type, title, summary, technical_detail, business_impact,
+      severity, cvss_score, cvss_vector, epss_score, cwe_id, cve_id,
+      owasp_category, affected_asset, affected_url,
       detection_source, detection_method, confidence, status,
-      assigned_user_id, verification_state, scope_validation_state,
+      assigned_user_id, verification_state, scope_validation,
       remediation, retest_status, duplicate_of, attack_chain_id,
       priority_score, first_seen, last_seen, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(
-      f.id, f.organization_id, f.target_id, f.asset_id, f.type, f.title, f.summary,
-      f.technical_description, f.business_impact, f.severity, f.cvss_score, f.cvss_vector,
-      f.epss_score, f.cwe, f.cve, f.owasp_category, f.affected_url,
+      f.id, f.id, f.organization_id, f.target_id, f.asset_id,
+      f.type, f.title, f.summary, f.technical_description, f.business_impact,
+      f.severity, f.cvss_score, f.cvss_vector, f.epss_score, f.cwe, f.cve,
+      f.owasp_category, f.affected_url ?? "", f.affected_url,
       f.detection_source, f.detection_method, f.confidence, f.status,
       f.assigned_user_id, f.verification_state, f.scope_validation_state,
       f.remediation, f.retest_status, f.duplicate_of, f.attack_chain_id,
@@ -69,7 +71,7 @@ export async function updateFindingStatus(
 
 export async function assignFinding(db: D1Database, findingId: string, userId: string): Promise<void> {
   await db
-    .prepare(`UPDATE findings SET assigned_user_id = ?, status = 'assigned', updated_at = ? WHERE id = ?`)
+    .prepare(`UPDATE findings SET assigned_user_id = ?, status = 'triaged', updated_at = ? WHERE id = ?`)
     .bind(userId, new Date().toISOString(), findingId)
     .run();
 }

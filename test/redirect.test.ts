@@ -15,7 +15,7 @@ function makeTarget(): Target {
 }
 
 const entries: ScopeEntry[] = [
-  { id: "s1", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+  { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
 ];
 
 describe("redirect validation", () => {

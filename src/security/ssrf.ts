@@ -120,8 +120,8 @@ export class SsrfBlockedError extends Error {
 }
 
 export async function safeFetch(
-  url: string,
   env: { USER_AGENT?: string } | undefined,
+  url: string,
   opts: SafeFetchOptions,
 ): Promise<SafeFetchResult> {
   const scopeCheck = checkUrlInScope(opts.scope, url);

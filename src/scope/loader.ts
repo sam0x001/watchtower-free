@@ -80,15 +80,17 @@ const TARGET_SELECT = `
          o.emergency_stop
     FROM targets t
     JOIN organizations o ON o.id = t.organization_id
-   WHERE t.id = ?1
+   WHERE t.id = ?
 `;
 
 const SCOPES_SELECT = `
   SELECT s.id, s.organization_id, s.target_id, s.scope_type, s.value, s.display_value,
-         s.status, s.is_denylist, s.include_subdomains, s.passive_only,
-         s.low_impact_active, s.intrusive_enabled, s.valid_from, s.valid_until
+         s.status, s.is_denylist, s.include_subdomains,
+         t.passive_only, t.low_impact_active, t.intrusive_enabled,
+         s.valid_from, s.valid_until
     FROM scopes s
-   WHERE s.target_id = ?1
+    JOIN targets t ON t.id = s.target_id
+   WHERE s.target_id = ?
      AND s.status != 'removed'
    ORDER BY s.is_denylist ASC, s.id ASC
 `;
@@ -96,7 +98,7 @@ const SCOPES_SELECT = `
 const RULES_SELECT = `
   SELECT id, scope_id, rule_kind, effect, value, value_end
     FROM scope_rules
-   WHERE organization_id = ?1
+   WHERE organization_id = ?
 `;
 
 interface ScopeRowLike {

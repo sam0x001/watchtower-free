@@ -128,13 +128,13 @@ export function classifyChange(changeType: string, confidence: number): "informa
 export async function persistChange(db: D1Database, record: Omit<ChangeRecord, "id">): Promise<string> {
   const id = randomId("chg", 12);
   await db
-    .prepare(`INSERT INTO changes (id, organization_id, target_id, asset_id, change_type, severity, before_json, after_json, confidence, volatile, first_seen, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .prepare(`INSERT INTO changes (id, change_ref, organization_id, target_id, asset_id, change_type, category, title, summary, severity, confidence, detection_source, scan_profile, entity, before_json, after_json, first_seen, last_seen, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'http', ?, ?, ?, ?, 'scan', 'passive-only', 'asset', ?, ?, ?, ?, ?, ?)`)
     .bind(
-      id, record.organization_id, record.target_id, record.asset_id ?? null,
-      record.change_type, record.severity,
+      id, id, record.organization_id, record.target_id, record.asset_id ?? null,
+      record.change_type, record.change_type, `${record.change_type} detected`,
+      record.severity, record.confidence,
       JSON.stringify(record.before), JSON.stringify(record.after),
-      record.confidence, record.volatile ? 1 : 0,
-      record.first_seen, new Date().toISOString(),
+      record.first_seen, record.first_seen, new Date().toISOString(), new Date().toISOString(),
     )
     .run();
   return id;

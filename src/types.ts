@@ -214,6 +214,7 @@ export interface User {
 
 export interface ScopeEntry {
   id: string;
+  organization_id: string;
   target_id: string;
   type: ScopeType;
   value: string;
@@ -222,6 +223,8 @@ export interface ScopeEntry {
   created_at: string;
   expires_at: string | null;
   paused: boolean;
+  /** Canonical `users.id` (required for FK-enforced created_by column on `scopes`). */
+  created_by?: string | null;
 }
 
 export interface Target {
@@ -238,6 +241,8 @@ export interface Target {
   authorization_expires_at: string;
   paused: boolean;
   created_at: string;
+  /** Canonical `users.id` (required for FK-enforced created_by column on `targets`). */
+  created_by?: string | null;
 }
 
 export interface ScanJob {

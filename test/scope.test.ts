@@ -31,7 +31,7 @@ describe("scope engine", () => {
   it("allows hosts matching a wildcard domain pattern", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     expect(checkHostInScope(compiled, "api.example.com").allowed).toBe(true);
@@ -42,7 +42,7 @@ describe("scope engine", () => {
   it("rejects out-of-scope hosts", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     expect(checkHostInScope(compiled, "attacker.com").allowed).toBe(false);
@@ -51,7 +51,7 @@ describe("scope engine", () => {
   it("rejects private IP ranges by default", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", target_id: "TGT_test", type: "cidr", value: "10.0.0.0/8", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "cidr", value: "10.0.0.0/8", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     const result = checkHostInScope(compiled, "10.0.0.5");
@@ -62,7 +62,7 @@ describe("scope engine", () => {
   it("blocks cloud metadata endpoints", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", target_id: "TGT_test", type: "wildcard_domain", value: "*", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     expect(checkHostInScope(compiled, "169.254.169.254").allowed).toBe(false);
@@ -78,8 +78,8 @@ describe("scope engine", () => {
   it("denies hosts in the denylist even when matching an allowlist", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
-      { id: "s2", target_id: "TGT_test", type: "domain", value: "internal.example.com", included: false, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s2", organization_id: "ORG_test", target_id: "TGT_test", type: "domain", value: "internal.example.com", included: false, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     expect(checkHostInScope(compiled, "internal.example.com").allowed).toBe(false);
@@ -89,7 +89,7 @@ describe("scope engine", () => {
   it("rejects when authorization has expired", () => {
     const target = makeTarget({ authorization_expires_at: "2020-01-01T00:00:00Z" });
     const entries: ScopeEntry[] = [
-      { id: "s1", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     const result = checkHostInScope(compiled, "api.example.com");
@@ -100,7 +100,7 @@ describe("scope engine", () => {
   it("URL scope check enforces host + URL prefix", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     expect(checkUrlInScope(compiled, "https://api.example.com/v1/users").allowed).toBe(true);
@@ -110,7 +110,7 @@ describe("scope engine", () => {
   it("handles IDN/punycode domains", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", target_id: "TGT_test", type: "domain", value: "xn--exmple-cua.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "domain", value: "xn--exmple-cua.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     // Hostname matching is exact-match; punycode must match punycode

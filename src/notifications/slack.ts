@@ -10,7 +10,7 @@ export async function sendSlack(env: Env, msg: NotificationMessage): Promise<boo
   const text = `*[${msg.severity.toUpperCase()}]* ${redacted}`;
   // Resolve a Slack channel from integrations table
   const integration = await env.DB
-    .prepare(`SELECT config_json FROM integrations WHERE organization_id = ? AND type = 'slack' AND enabled = 1`)
+    .prepare(`SELECT config_json FROM integrations WHERE organization_id = ? AND kind = 'slack' AND enabled = 1`)
     .bind(msg.organization_id)
     .first<{ config_json: string }>();
   if (!integration) return false;

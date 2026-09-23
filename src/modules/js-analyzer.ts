@@ -143,16 +143,19 @@ export async function analyzeJsForAsset(
         const findingId = `FND_${crypto.randomUUID()}`;
         await env.DB
           .prepare(`INSERT INTO findings (
-            id, organization_id, target_id, asset_id, type, title, summary,
-            technical_description, severity, detection_source, detection_method,
-            confidence, status, verification_state, scope_validation_state,
+            id, finding_ref, organization_id, target_id, asset_id,
+            finding_type, title, summary, technical_detail,
+            severity, detection_source, detection_method,
+            confidence, status, verification_state, scope_validation,
+            affected_asset,
             first_seen, last_seen, created_at, updated_at
-          ) VALUES (?, (SELECT organization_id FROM targets WHERE id = ?), ?, ?, 'exposed_secret_candidate', ?, ?, '', 'high', 'js-analysis', 'regex-detection', ?, 'open', 'detected', 'pending', ?, ?, ?, ?)`)
+          ) VALUES (?, ?, (SELECT organization_id FROM targets WHERE id = ?), ?, ?, 'exposed_secret_candidate', ?, ?, '', 'high', 'js-analysis', 'regex-detection', ?, 'open', 'detected', 'pending', ?, ?, ?, ?, ?)`)
           .bind(
-            findingId, targetId, targetId, assetId,
+            findingId, findingId, targetId, targetId, assetId,
             `Possible ${s.type} detected in JavaScript`,
             `A high-confidence ${s.type} pattern was detected at line ${s.line} of ${jsUrl}. Value has been redacted; fingerprint stored. Manual review required.`,
             s.confidence,
+            jsUrl,
             new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), new Date().toISOString(),
           )
           .run();

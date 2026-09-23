@@ -7,7 +7,7 @@ import { log } from "../audit/logger.js";
 
 export async function sendGenericWebhook(env: Env, msg: NotificationMessage): Promise<boolean> {
   const integration = await env.DB
-    .prepare(`SELECT config_json FROM integrations WHERE organization_id = ? AND type = 'webhook' AND enabled = 1`)
+    .prepare(`SELECT config_json FROM integrations WHERE organization_id = ? AND kind = 'generic_webhook' AND enabled = 1`)
     .bind(msg.organization_id)
     .first<{ config_json: string }>();
   if (!integration) return false;

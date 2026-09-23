@@ -31,7 +31,7 @@ export async function dispatchPendingNotifications(
   ctx: ExecutionContext,
 ): Promise<{ claimed: number; sent: number; failed: number }> {
   const log = defaultLog;
-  const maxPerCron = num(env.FREE_TIER_MAX_JOBS_PER_CRON, 10);
+  const maxPerCron = num(env.FREE_TIER_MAX_NOTIFICATIONS_PER_CRON, 10);
 
   const jobs = await claimPendingJobs(env.DB, "notification", maxPerCron, 60_000);
   let sent = 0;
@@ -46,7 +46,7 @@ export async function dispatchPendingNotifications(
       const dedupKey = data.dedup_key ?? job.payload["dedup_key"] as string | undefined;
       if (dedupKey) {
         const existing = await env.DB
-          .prepare(`SELECT id FROM notifications WHERE dedup_key = ? AND status = 'sent' AND created_at > ?`)
+          .prepare(`SELECT id FROM notifications WHERE dedupe_key = ? AND status = 'sent' AND created_at > ?`)
           .bind(dedupKey, new Date(Date.now() - 24 * 3600 * 1000).toISOString())
           .first<{ id: string }>();
         if (existing) {
@@ -57,8 +57,8 @@ export async function dispatchPendingNotifications(
 
       const id = `notif_${crypto.randomUUID()}`;
       await env.DB
-        .prepare(`INSERT INTO notifications (id, organization_id, target_id, finding_id, change_id, channel, severity, payload_json, dedup_key, status, attempts, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
-        .bind(id, data.organization_id, data.target_id, data.finding_id ?? null, data.change_id ?? null, data.channel, data.severity, JSON.stringify(data.payload), dedupKey ?? `adhoc-${id}`, (job.attempts ?? 1) - 1, new Date().toISOString())
+        .prepare(`INSERT INTO notifications (id, organization_id, target_id, finding_id, channel, destination, alert_type, severity, title, body_redacted, dedupe_key, status, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'scan_alert', ?, ?, ?, ?, 'pending', ?, ?, ?)`)
+        .bind(id, data.organization_id, data.target_id ?? null, data.finding_id ?? null, data.channel, data.channel, data.severity, String(data.payload?.title ?? 'Watchtower alert'), JSON.stringify(data.payload), dedupKey ?? `adhoc-${id}`, (job.attempts ?? 1) - 1, new Date().toISOString(), new Date().toISOString())
         .run();
 
       const { redacted } = redactSync(JSON.stringify(data.payload, null, 2));
@@ -71,14 +71,14 @@ export async function dispatchPendingNotifications(
           case "telegram": {
             const message = formatTelegramAlert(data.severity, sanitizedPayload);
             const owner = await env.DB
-              .prepare(`SELECT u.telegram_id FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.organization_id = ? AND m.role = 'owner' LIMIT 1`)
+              .prepare(`SELECT u.telegram_user_id FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id WHERE m.organization_id = ? AND r.name = 'owner' LIMIT 1`)
               .bind(data.organization_id)
-              .first<{ telegram_id: string }>();
-            if (owner?.telegram_id) {
-              await sendMessage(env, Number(owner.telegram_id), message, { parseMode: "HTML" });
+              .first<{ telegram_user_id: string }>();
+            if (owner?.telegram_user_id) {
+              await sendMessage(env, Number(owner.telegram_user_id), message, { parseMode: "HTML" });
               didSend = true;
             } else {
-              lastErr = "no owner telegram_id found";
+              lastErr = "no owner telegram_user_id found";
             }
             break;
           }

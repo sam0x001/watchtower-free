@@ -56,14 +56,14 @@ export async function findDuplicates(
   // We don't store the fingerprint directly in the schema for v1; compute on demand.
   // For large datasets, add an index on a fingerprint column.
   const rows = await db
-    .prepare(`SELECT id, type, affected_url, cve, cwe, detection_source FROM findings WHERE organization_id = ? AND status NOT IN ('closed')`)
+    .prepare(`SELECT id, finding_type, affected_url, cve_id, cwe_id, detection_source FROM findings WHERE organization_id = ? AND status NOT IN ('closed')`)
     .bind(orgId)
     .all<Record<string, unknown>>();
   const dupes: string[] = [];
   for (const r of rows.results ?? []) {
-    if (r["type"] !== fp.components.type) continue;
-    if (r["cve"] !== fp.components.cve) continue;
-    if (r["cwe"] !== fp.components.cwe) continue;
+    if (r["finding_type"] !== fp.components.type) continue;
+    if (r["cve_id"] !== fp.components.cve) continue;
+    if (r["cwe_id"] !== fp.components.cwe) continue;
     if (r["detection_source"] !== fp.components.detection_source) continue;
     const theirUrl = (r["affected_url"] as string | null) ?? "";
     const canon = canonicalizeUrl(theirUrl);
@@ -94,21 +94,23 @@ export async function splitFinding(db: D1Database, findingId: string): Promise<s
   if (!original) throw new Error("finding not found");
   const newId = `FND_${crypto.randomUUID()}`;
   await db.prepare(`INSERT INTO findings (
-    id, organization_id, target_id, asset_id, type, title, summary,
-    technical_description, business_impact, severity, cvss_score, cvss_vector,
-    epss_score, cwe, cve, owasp_category, affected_url,
+    id, finding_ref, organization_id, target_id, asset_id,
+    finding_type, title, summary, technical_detail, business_impact,
+    severity, cvss_score, cvss_vector, epss_score, cwe_id, cve_id,
+    owasp_category, affected_asset, affected_url,
     detection_source, detection_method, confidence, status,
-    assigned_user_id, verification_state, scope_validation_state,
+    assigned_user_id, verification_state, scope_validation,
     remediation, retest_status, duplicate_of, attack_chain_id,
     priority_score, first_seen, last_seen, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, 'detected', 'pending', NULL, NULL, NULL, NULL, 0, ?, ?, ?, ?)`)
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, 'detected', 'pending', NULL, NULL, NULL, NULL, 0, ?, ?, ?, ?)`)
     .bind(
-      newId,
+      newId, newId,
       original["organization_id"], original["target_id"], original["asset_id"],
-      original["type"], original["title"], original["summary"],
-      original["technical_description"], original["business_impact"], original["severity"],
+      original["finding_type"], original["title"], original["summary"],
+      original["technical_detail"], original["business_impact"], original["severity"],
       original["cvss_score"], original["cvss_vector"], original["epss_score"],
-      original["cwe"], original["cve"], original["owasp_category"], original["affected_url"],
+      original["cwe_id"], original["cve_id"], original["owasp_category"],
+      String(original["affected_asset"] ?? ""), original["affected_url"],
       original["detection_source"], original["detection_method"], original["confidence"],
       new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), new Date().toISOString(),
     ).run();

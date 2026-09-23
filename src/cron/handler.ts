@@ -63,16 +63,16 @@ export async function handleScheduled(
 
   if (!globalStop) {
     const targets = await env.DB
-      .prepare(`SELECT t.id, t.name, t.organization_id, t.authorization_expires_at, t.paused FROM targets t WHERE t.paused = 0`)
-      .all<{ id: string; name: string; organization_id: string; authorization_expires_at: string; paused: number }>();
+      .prepare(`SELECT t.id, t.name, t.organization_id, t.valid_until, t.status FROM targets t WHERE t.status = 'active'`)
+      .all<{ id: string; name: string; organization_id: string; valid_until: string; status: string }>();
 
     for (const t of targets.results ?? []) {
       // Check emergency stop per-target
       if (await es.isBlocked("target", t.id)) continue;
 
       // Check expiry
-      if (isScopeExpired({ authorization_expires_at: t.authorization_expires_at } as never, now)) {
-        await env.DB.prepare(`UPDATE targets SET paused = 1 WHERE id = ?`).bind(t.id).run();
+      if (isScopeExpired({ authorization_expires_at: t.valid_until } as never, now)) {
+        await env.DB.prepare(`UPDATE targets SET status = 'paused', paused_at = ?, updated_at = ? WHERE id = ?`).bind(now.toISOString(), now.toISOString(), t.id).run();
         await env.DB.prepare(`UPDATE job_queue SET status = 'cancelled' WHERE kind = 'scan' AND json_extract(payload_json, '$.target_id') = ? AND status IN ('pending','running')`)
           .bind(t.id).run();
         expiredTargets++;
@@ -80,12 +80,12 @@ export async function handleScheduled(
       }
 
       // Expiring-soon warning
-      if (scopeExpiringSoon({ authorization_expires_at: t.authorization_expires_at } as never, num(env.SCOPE_EXPIRY_WARNING_DAYS, SCOPE_EXPIRY_WARNING_DAYS), now)) {
+      if (scopeExpiringSoon({ authorization_expires_at: t.valid_until } as never, num(env.SCOPE_EXPIRY_WARNING_DAYS, SCOPE_EXPIRY_WARNING_DAYS), now)) {
         const owner = await env.DB
-          .prepare(`SELECT u.telegram_id FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.organization_id = ? AND m.role = 'owner' LIMIT 1`)
+          .prepare(`SELECT u.telegram_user_id FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id WHERE m.organization_id = ? AND r.name = 'owner' LIMIT 1`)
           .bind(t.organization_id)
-          .first<{ telegram_id: string }>();
-        if (owner?.telegram_id) {
+          .first<{ telegram_user_id: string }>();
+        if (owner?.telegram_user_id) {
           await enqueueJob(env.DB, "notification", {
             organization_id: t.organization_id,
             target_id: t.id,
@@ -93,15 +93,15 @@ export async function handleScheduled(
             severity: "high",
             payload: {
               title: `Authorization expiring soon for ${t.name}`,
-              summary: `Target ${t.name} (ID ${t.id}) will expire on ${t.authorization_expires_at}.\nUse /scope_expire ${t.id} or extend authorization before the deadline.`,
+              summary: `Target ${t.name} (ID ${t.id}) will expire on ${t.valid_until}.\nUse /scope_expire ${t.id} or extend authorization before the deadline.`,
               change_type: "authorization_expiring",
               target_id: t.id,
               target_name: t.name,
-              expires_at: t.authorization_expires_at,
+              expires_at: t.valid_until,
             },
-            dedup_key: `auth_expiring:${t.id}:${t.authorization_expires_at.slice(0, 10)}`,
+            dedup_key: `auth_expiring:${t.id}:${t.valid_until.slice(0, 10)}`,
             attempt: 0,
-          }, { dedup_key: `auth_expiring:${t.id}:${t.authorization_expires_at.slice(0, 10)}` });
+          }, { dedup_key: `auth_expiring:${t.id}:${t.valid_until.slice(0, 10)}` });
           warningTargets++;
         }
       }

@@ -15,7 +15,7 @@ import { listAuditLogs } from "../db/queries/audit.js";
 import { generateReportRoute } from "./routes/reports.js";
 import { handleRunnerCallback } from "./routes/webhooks.js";
 
-interface RouteContext {
+export interface RouteContext {
   env: Env;
   request: Request;
   url: URL;

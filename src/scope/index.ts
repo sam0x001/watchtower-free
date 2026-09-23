@@ -215,8 +215,6 @@ export {
   parseAsset,
   isBlockedIp,
   isWildcardTooBroad,
-  loadScopeSnapshot,
-  assertInScope,
 } from "./match.js";
 export { loadScopeSnapshot as loadScope } from "./loader.js";
 export type { ScopeRecord, ScopeRule, ParsedAsset, EvaluateScopeOptions } from "./match.js";

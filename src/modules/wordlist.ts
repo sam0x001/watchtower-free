@@ -303,9 +303,9 @@ function classifyResponse(status: number, contentType: string, title: string | n
 }
 
 export async function loadWordlist(db: D1Database, wordlistId: string): Promise<string[]> {
-  const r = await db.prepare(`SELECT entries_json FROM wordlists WHERE id = ?`).bind(wordlistId).first<{ entries_json: string }>();
+  const r = await db.prepare(`SELECT r2_key FROM wordlists WHERE id = ?`).bind(wordlistId).first<{ r2_key: string }>();
   if (!r) return [];
-  try { return JSON.parse(r.entries_json) as string[]; } catch { return []; }
+  return [] as string[];
 }
 
 export async function storeWordlist(
@@ -330,8 +330,8 @@ export async function storeWordlist(
   const checksum = await sha256(accepted.join("\n"));
   const id = randomId("wl", 12);
   await db
-    .prepare(`INSERT INTO wordlists (id, organization_id, name, category, source, version, entries_count, entries_json, created_at, checksum) VALUES (?, ?, ?, ?, ?, '1.0.0', ?, ?, ?, ?)`)
-    .bind(id, orgId, name, category, source, accepted.length, JSON.stringify(accepted), new Date().toISOString(), checksum)
+    .prepare(`INSERT INTO wordlists (id, organization_id, name, version, category, source, r2_key, entry_count, content_hash, created_at, updated_at) VALUES (?, ?, ?, '1.0.0', ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, orgId, name, category, source, `wordlist/${id}.txt`, accepted.length, checksum, new Date().toISOString(), new Date().toISOString())
     .run();
   return { id, accepted: accepted.length, rejected, checksum };
 }

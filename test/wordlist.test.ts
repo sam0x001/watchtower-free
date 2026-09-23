@@ -39,16 +39,16 @@ describe("wordlist sanitization", () => {
 
 describe("wordlist profiles", () => {
   it("passive-only profile has zero requests", () => {
-    expect(WORDLIST_PROFILES["passive-only"].maxRequests).toBe(0);
+    expect(WORDLIST_PROFILES["passive-only"]!.maxRequests).toBe(0);
   });
 
   it("low-impact profiles require human approval", () => {
-    expect(WORDLIST_PROFILES["low-impact-web-content"].requiresHumanApproval).toBe(true);
-    expect(WORDLIST_PROFILES["low-impact-api-discovery"].requiresHumanApproval).toBe(true);
+    expect(WORDLIST_PROFILES["low-impact-web-content"]!.requiresHumanApproval).toBe(true);
+    expect(WORDLIST_PROFILES["low-impact-api-discovery"]!.requiresHumanApproval).toBe(true);
   });
 
   it("javascript-monitoring allows reasonable concurrency", () => {
-    expect(WORDLIST_PROFILES["javascript-monitoring"].maxConcurrency).toBeLessThanOrEqual(3);
+    expect(WORDLIST_PROFILES["javascript-monitoring"]!.maxConcurrency).toBeLessThanOrEqual(3);
   });
 
   it("all profiles have stop conditions defined", () => {

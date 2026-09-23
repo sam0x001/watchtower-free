@@ -15,6 +15,37 @@ export interface UpsertResult {
   previous_sha?: string;
 }
 
+/**
+ * Asset-family tables (`assets`, `dns_records`, `certificates`, `services`,
+ * `technologies`, `api_endpoints`, `javascript_files`) are keyed off the
+ * organization + target in the canonical schema and require both on INSERT.
+ * Callers resolve these once per scan and pass them alongside the asset id.
+ */
+export type AssetCtxInput = { organizationId: string; targetId: string; assetId: string } | string;
+
+async function resolveCtx(db: D1Database, ctx: AssetCtxInput): Promise<{ organizationId: string; targetId: string; assetId: string }> {
+  if (typeof ctx !== "string") return ctx;
+  const row = await db
+    .prepare(`SELECT organization_id, target_id FROM assets WHERE id = ?`)
+    .bind(ctx)
+    .first<{ organization_id: string; target_id: string }>();
+  return { organizationId: row?.organization_id ?? "", targetId: row?.target_id ?? "", assetId: ctx };
+}
+
+function hostnameOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+function mapScopeState(scopeStatus: string): string {
+  if (scopeStatus === "in_scope") return "allowed";
+  if (scopeStatus === "out_of_scope") return "denied";
+  return "unknown";
+}
+
 export async function upsertAsset(
   db: D1Database,
   targetId: string,
@@ -24,103 +55,115 @@ export async function upsertAsset(
   scopeStatus: string,
   metadata: Record<string, unknown> = {},
 ): Promise<UpsertResult> {
+  const now = new Date().toISOString();
   const existing = await db
-    .prepare(`SELECT id FROM assets WHERE target_id = ? AND type = ? AND normalized = ?`)
+    .prepare(`SELECT id FROM assets WHERE target_id = ? AND asset_type = ? AND identifier = ?`)
     .bind(targetId, type, normalized)
     .first<{ id: string }>();
   if (existing) {
     await db
-      .prepare(`UPDATE assets SET last_seen = ?, scope_status = ?, metadata_json = ? WHERE id = ?`)
-      .bind(new Date().toISOString(), scopeStatus, JSON.stringify(metadata), existing.id)
+      .prepare(`UPDATE assets SET last_seen = ?, scope_state = ?, in_scope = ?, attributes_json = ? WHERE id = ?`)
+      .bind(now, mapScopeState(scopeStatus), scopeStatus === "in_scope" ? 1 : 0, JSON.stringify(metadata), existing.id)
       .run();
     return { id: existing.id, created: false };
   }
   const id = randomId("asset", 16);
+  const orgRow = await db
+    .prepare(`SELECT organization_id FROM targets WHERE id = ?`)
+    .bind(targetId)
+    .first<{ organization_id: string }>();
+  const organizationId = orgRow?.organization_id ?? "";
   await db
-    .prepare(`INSERT INTO assets (id, target_id, type, value, normalized, first_seen, last_seen, scope_status, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, targetId, type, value, normalized, new Date().toISOString(), new Date().toISOString(), scopeStatus, JSON.stringify(metadata))
+    .prepare(`INSERT INTO assets (id, organization_id, target_id, asset_type, identifier, display_name, in_scope, scope_state, source, first_seen, last_seen, attributes_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'scan', ?, ?, ?, ?, ?)`)
+    .bind(id, organizationId, targetId, type, normalized, value, scopeStatus === "in_scope" ? 1 : 0, mapScopeState(scopeStatus), now, now, JSON.stringify(metadata), now, now)
     .run();
   return { id, created: true };
 }
 
 export async function markAssetRemoved(db: D1Database, assetId: string): Promise<void> {
+  const now = new Date().toISOString();
   await db
-    .prepare(`UPDATE assets SET scope_status = 'out_of_scope' WHERE id = ?`)
-    .bind(assetId)
+    .prepare(`UPDATE assets SET status = 'removed', removed_at = ?, removed_reason = 'scan' WHERE id = ?`)
+    .bind(now, assetId)
     .run();
   await db
-    .prepare(`UPDATE dns_records SET removed_at = ? WHERE asset_id = ? AND removed_at IS NULL`)
-    .bind(new Date().toISOString(), assetId)
+    .prepare(`UPDATE dns_records SET removed_at = ?, is_current = 0 WHERE asset_id = ? AND removed_at IS NULL`)
+    .bind(now, assetId)
     .run();
   await db
-    .prepare(`UPDATE certificates SET removed_at = ? WHERE asset_id = ? AND removed_at IS NULL`)
-    .bind(new Date().toISOString(), assetId)
+    .prepare(`UPDATE certificates SET status = 'disappeared', disappeared_at = ? WHERE asset_id = ? AND disappeared_at IS NULL`)
+    .bind(now, assetId)
     .run();
 }
 
 export async function upsertDnsRecord(
   db: D1Database,
-  assetId: string,
+  ctx: AssetCtxInput,
   type: string,
   name: string,
   value: string,
   ttl: number | null,
 ): Promise<UpsertResult> {
+  const c = await resolveCtx(db, ctx);
+  const now = new Date().toISOString();
   // Re-resurrect if previously removed
   await db
-    .prepare(`UPDATE dns_records SET removed_at = NULL, last_seen = ?, value = ? WHERE asset_id = ? AND type = ? AND name = ? AND value = ?`)
-    .bind(new Date().toISOString(), value, assetId, type, name, value)
+    .prepare(`UPDATE dns_records SET removed_at = NULL, is_current = 1, last_seen = ?, value = ? WHERE asset_id = ? AND record_type = ? AND hostname = ? AND value = ?`)
+    .bind(now, value, c.assetId, type, name, value)
     .run();
   const existing = await db
-    .prepare(`SELECT id FROM dns_records WHERE asset_id = ? AND type = ? AND name = ? AND value = ? AND removed_at IS NULL`)
-    .bind(assetId, type, name, value)
+    .prepare(`SELECT id FROM dns_records WHERE asset_id = ? AND record_type = ? AND hostname = ? AND value = ? AND removed_at IS NULL`)
+    .bind(c.assetId, type, name, value)
     .first<{ id: string }>();
   if (existing) {
     await db
       .prepare(`UPDATE dns_records SET last_seen = ? WHERE id = ?`)
-      .bind(new Date().toISOString(), existing.id)
+      .bind(now, existing.id)
       .run();
     return { id: existing.id, created: false };
   }
   const id = randomId("dns", 12);
+  const fingerprint = Buffer.from(`${type}|${name}|${value}`).toString("base64url");
   await db
-    .prepare(`INSERT INTO dns_records (id, asset_id, type, name, value, ttl, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, assetId, type, name, value, ttl, new Date().toISOString(), new Date().toISOString())
+    .prepare(`INSERT INTO dns_records (id, organization_id, target_id, asset_id, hostname, record_type, value, ttl, first_seen, last_seen, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, c.organizationId, c.targetId, c.assetId, name, type, value, ttl, now, now, fingerprint)
     .run();
   return { id, created: true };
 }
 
 export async function upsertCertificate(
   db: D1Database,
-  assetId: string,
+  ctx: AssetCtxInput,
   issuer: string,
   serial: string,
   notBefore: string | null,
   notAfter: string | null,
   sans: string[],
 ): Promise<UpsertResult> {
+  const c = await resolveCtx(db, ctx);
+  const now = new Date().toISOString();
   const existing = await db
-    .prepare(`SELECT id FROM certificates WHERE asset_id = ? AND serial = ?`)
-    .bind(assetId, serial)
+    .prepare(`SELECT id FROM certificates WHERE asset_id = ? AND serial_number = ?`)
+    .bind(c.assetId, serial)
     .first<{ id: string }>();
   if (existing) {
     await db
-      .prepare(`UPDATE certificates SET last_seen = ?, not_after = ?, removed_at = NULL WHERE id = ?`)
-      .bind(new Date().toISOString(), notAfter, existing.id)
+      .prepare(`UPDATE certificates SET last_seen = ?, not_after = ?, status = 'active', disappeared_at = NULL WHERE id = ?`)
+      .bind(now, notAfter, existing.id)
       .run();
     return { id: existing.id, created: false };
   }
   const id = randomId("cert", 12);
   await db
-    .prepare(`INSERT INTO certificates (id, asset_id, issuer, serial, not_before, not_after, sans_json, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, assetId, issuer, serial, notBefore, notAfter, JSON.stringify(sans), new Date().toISOString(), new Date().toISOString())
+    .prepare(`INSERT INTO certificates (id, organization_id, target_id, asset_id, source, serial_number, issuer_cn, not_before, not_after, dns_names, first_seen, last_seen) VALUES (?, ?, ?, ?, 'scan', ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, c.organizationId, c.targetId, c.assetId, serial, issuer, notBefore, notAfter, JSON.stringify(sans), now, now)
     .run();
   return { id, created: true };
 }
 
 export async function upsertJavascriptFile(
   db: D1Database,
-  assetId: string,
+  ctx: AssetCtxInput,
   url: string,
   sha256: string,
   sizeBytes: number,
@@ -128,55 +171,59 @@ export async function upsertJavascriptFile(
   lastModified: string | null,
   contentType: string | null,
 ): Promise<UpsertResult> {
+  const c = await resolveCtx(db, ctx);
+  const now = new Date().toISOString();
   const existing = await db
-    .prepare(`SELECT id, sha256 FROM javascript_files WHERE asset_id = ? AND url = ? AND removed_at IS NULL`)
-    .bind(assetId, url)
-    .first<{ id: string; sha256: string }>();
+    .prepare(`SELECT id, content_hash FROM javascript_files WHERE asset_id = ? AND url_canonical = ? AND status = 'active'`)
+    .bind(c.assetId, url)
+    .first<{ id: string; content_hash: string | null }>();
   if (existing) {
-    if (existing.sha256 !== sha256) {
+    if ((existing.content_hash ?? null) !== sha256) {
       await db
-        .prepare(`UPDATE javascript_files SET sha256 = ?, size_bytes = ?, etag = ?, last_modified = ?, content_type = ?, last_seen = ? WHERE id = ?`)
-        .bind(sha256, sizeBytes, etag, lastModified, contentType, new Date().toISOString(), existing.id)
+        .prepare(`UPDATE javascript_files SET content_hash = ?, content_length = ?, etag = ?, last_modified = ?, content_type = ?, last_seen = ? WHERE id = ?`)
+        .bind(sha256, sizeBytes, etag, lastModified, contentType, now, existing.id)
         .run();
-      return { id: existing.id, created: false, previous_sha: existing.sha256 };
+      return { id: existing.id, created: false, previous_sha: existing.content_hash ?? undefined };
     }
     await db
       .prepare(`UPDATE javascript_files SET last_seen = ? WHERE id = ?`)
-      .bind(new Date().toISOString(), existing.id)
+      .bind(now, existing.id)
       .run();
     return { id: existing.id, created: false };
   }
   const id = randomId("js", 16);
   await db
-    .prepare(`INSERT INTO javascript_files (id, asset_id, url, sha256, size_bytes, etag, last_modified, content_type, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, assetId, url, sha256, sizeBytes, etag, lastModified, contentType, new Date().toISOString(), new Date().toISOString())
+    .prepare(`INSERT INTO javascript_files (id, organization_id, target_id, asset_id, url, url_canonical, hostname, content_hash, content_length, etag, last_modified, content_type, discovered_via, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scan', ?, ?)`)
+    .bind(id, c.organizationId, c.targetId, c.assetId, url, url, hostnameOf(url), sha256, sizeBytes, etag, lastModified, contentType, now, now)
     .run();
   return { id, created: true };
 }
 
 export async function insertApiEndpoint(
   db: D1Database,
-  assetId: string,
+  ctx: AssetCtxInput,
   method: string,
   path: string,
   parameters: Record<string, unknown>[],
   source: string,
 ): Promise<{ id: string; inserted: boolean }> {
+  const c = await resolveCtx(db, ctx);
+  const now = new Date().toISOString();
   const existing = await db
-    .prepare(`SELECT id FROM api_endpoints WHERE asset_id = ? AND method = ? AND path = ? AND removed_at IS NULL`)
-    .bind(assetId, method, path)
+    .prepare(`SELECT id FROM api_endpoints WHERE asset_id = ? AND method = ? AND path = ? AND status = 'active'`)
+    .bind(c.assetId, method, path)
     .first<{ id: string }>();
   if (existing) {
     await db
       .prepare(`UPDATE api_endpoints SET last_seen = ? WHERE id = ?`)
-      .bind(new Date().toISOString(), existing.id)
+      .bind(now, existing.id)
       .run();
     return { id: existing.id, inserted: false };
   }
   const id = randomId("api", 12);
   await db
-    .prepare(`INSERT INTO api_endpoints (id, asset_id, method, path, parameters_json, source, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, assetId, method, path, JSON.stringify(parameters), source, new Date().toISOString(), new Date().toISOString())
+    .prepare(`INSERT INTO api_endpoints (id, organization_id, target_id, asset_id, base_url, method, path, parameters, discovery_source, first_seen, last_seen) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)`)
+    .bind(id, c.organizationId, c.targetId, c.assetId, method, path, JSON.stringify(parameters), source, now, now)
     .run();
   return { id, inserted: true };
 }
@@ -209,29 +256,29 @@ export async function upsertService(
   serverHeader: string | null,
 ): Promise<ServiceUpsertResult> {
   const existing = await db
-    .prepare(`SELECT id, http_status, http_title, server_header, banner FROM services WHERE asset_id = ? AND port = ? AND protocol = ? AND removed_at IS NULL`)
+    .prepare(`SELECT id, tls_json, banner_redacted, service_name FROM services WHERE asset_id = ? AND port = ? AND removed_at IS NULL`)
     .bind(assetId, port, protocol)
-    .first<{ id: string; http_status: number | null; http_title: string | null; server_header: string | null; banner: string | null }>();
+    .first<{ id: string; tls_json: string; banner_redacted: string | null; service_name: string | null }>();
 
   const changes: { field: string; before: string; after: string }[] = [];
 
   if (existing) {
-    if (existing.http_status !== httpStatus) {
-      changes.push({ field: "http_status", before: String(existing.http_status ?? "—"), after: String(httpStatus ?? "—") });
+    if (Number((JSON.parse(existing.tls_json || '{}') as Record<string, unknown>).status ?? null) !== httpStatus) {
+      changes.push({ field: "http_status", before: String((JSON.parse(existing.tls_json || "{}") as Record<string, unknown>).status ?? "—"), after: String(httpStatus ?? "—") });
     }
-    if ((existing.http_title ?? null) !== (httpTitle ?? null)) {
-      changes.push({ field: "http_title", before: existing.http_title ?? "—", after: httpTitle ?? "—" });
+    if (((JSON.parse(existing.tls_json || '{}') as Record<string, unknown>).title ?? null) !== (httpTitle ?? null)) {
+      changes.push({ field: "http_title", before: String((JSON.parse(existing.tls_json || "{}") as Record<string, unknown>).title ?? "—"), after: httpTitle ?? "—" });
     }
-    if ((existing.server_header ?? null) !== (serverHeader ?? null)) {
-      changes.push({ field: "server_header", before: existing.server_header ?? "—", after: serverHeader ?? "—" });
+    if ((existing.service_name ?? null) !== (serverHeader ?? null)) {
+      changes.push({ field: "server_header", before: existing.service_name ?? "—", after: serverHeader ?? "—" });
     }
-    if ((existing.banner ?? null) !== (banner ?? null)) {
-      changes.push({ field: "banner", before: existing.banner ?? "—", after: banner ?? "—" });
+    if ((existing.banner_redacted ?? null) !== (banner ?? null)) {
+      changes.push({ field: "banner", before: existing.banner_redacted ?? "—", after: banner ?? "—" });
     }
     if (changes.length > 0) {
       await db
-        .prepare(`UPDATE services SET http_status = ?, http_title = ?, server_header = ?, banner = ?, tls_json = ?, last_seen = ? WHERE id = ?`)
-        .bind(httpStatus, httpTitle, serverHeader, banner, tlsJson, new Date().toISOString(), existing.id)
+        .prepare(`UPDATE services SET tls_json = ?, banner_redacted = ?, service_name = ?, last_seen = ?, updated_at = ? WHERE id = ?`)
+        .bind(JSON.stringify({ status: httpStatus, title: httpTitle, server: serverHeader, extra: tlsJson }), banner, serverHeader, new Date().toISOString(), new Date().toISOString(), existing.id)
         .run();
     } else {
       await db
@@ -244,8 +291,8 @@ export async function upsertService(
 
   const id = randomId("svc", 12);
   await db
-    .prepare(`INSERT INTO services (id, asset_id, port, protocol, banner, tls_json, http_status, http_title, server_header, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, assetId, port, protocol, banner, tlsJson, httpStatus, httpTitle, serverHeader, new Date().toISOString(), new Date().toISOString())
+    .prepare(`INSERT INTO services (id, organization_id, target_id, asset_id, hostname, port, transport, protocol, service_name, banner_redacted, tls_json, state, discovery_method, confidence, first_seen, last_seen, created_at, updated_at) VALUES (?, (SELECT organization_id FROM assets WHERE id = ?), (SELECT target_id FROM assets WHERE id = ?), ?, (SELECT identifier FROM assets WHERE id = ?), ?, 'tcp', ?, ?, ?, ?, 'open', 'scan', 0.7, ?, ?, ?, ?)`)
+    .bind(id, assetId, assetId, assetId, assetId, port, protocol, serverHeader, banner, JSON.stringify({ status: httpStatus, title: httpTitle, server: serverHeader, extra: tlsJson }), new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), new Date().toISOString())
     .run();
   return { id, created: true, changes: [] };
 }
@@ -281,8 +328,8 @@ export async function upsertTechnology(
     const versionChanged = (existing.version ?? null) !== (version ?? null);
     if (versionChanged) {
       await db
-        .prepare(`UPDATE technologies SET version = ?, confidence = ?, source = ?, last_seen = ? WHERE id = ?`)
-        .bind(version, confidence, source, new Date().toISOString(), existing.id)
+        .prepare(`UPDATE technologies SET version = ?, confidence = ?, detection_method = ?, last_seen = ?, updated_at = ? WHERE id = ?`)
+        .bind(version, confidence, source, new Date().toISOString(), new Date().toISOString(), existing.id)
         .run();
     } else {
       await db
@@ -300,8 +347,8 @@ export async function upsertTechnology(
 
   const id = randomId("tech", 12);
   await db
-    .prepare(`INSERT INTO technologies (id, asset_id, name, version, confidence, source, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, assetId, name, version, confidence, source, new Date().toISOString(), new Date().toISOString())
+    .prepare(`INSERT INTO technologies (id, organization_id, target_id, asset_id, name, category, version, confidence, detection_method, first_seen, last_seen, created_at, updated_at) VALUES (?, (SELECT organization_id FROM assets WHERE id = ?), (SELECT target_id FROM assets WHERE id = ?), ?, ?, 'fingerprint', ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, assetId, assetId, assetId, name, version, confidence, source, new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), new Date().toISOString())
     .run();
   return { id, created: true, versionChanged: false, previousVersion: null };
 }
