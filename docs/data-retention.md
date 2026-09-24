@@ -1,67 +1,47 @@
-# Watchtower — Data Retention Policy
+# Watchtower — Data Retention
 
-## Overview
+## What is kept
 
-Watchtower retains data only as long as needed to support authorized
-security monitoring, audit, and incident response. After retention windows
-expire, data is permanently deleted from D1, R2, and KV.
+Everything lives in D1 (plus two small KV cursor families). There is no R2,
+no evidence store, and no audit log in v4.
 
-## Retention windows
+| Data | Retention | Enforced by |
+|---|---|---|
+| Targets, scopes/exclusions, categories | Until `/remove` | manual |
+| Assets, DNS records, certificates, services, technologies, JS files, API endpoints | Until `/remove` (FK cascade) | manual |
+| Findings | Until `/remove` (FK cascade) — kept forever otherwise | manual |
+| Scans history | Until `/remove` | manual |
+| `job_queue` rows | **7 days** (`LIMITS.JOB_RETENTION_DAYS`) | hourly cron purge |
+| `notifications` log | **30 days** (`LIMITS.NOTIFICATION_RETENTION_DAYS`) | hourly cron purge |
+| `target_features` toggles | Until the domain is removed | FK cascade |
+| KV `bf:*` / `fuzz:*` / `pw:*` cursors | Last write wins; wrap around on completion | replaced on next tick |
+| KV `wc:*` wildcard-DNS cache | **7 days** | KV `expirationTtl` |
 
-| Data class | Default retention | Source |
-|------------|-------------------|--------|
-| Evidence (HTTP responses, JS snapshots, scanner output) | 180 days | `EVIDENCE_RETENTION_DAYS` env var |
-| Findings | Until target is decommissioned | (No automatic deletion) |
-| Audit logs | 730 days (2 years) | `AUDIT_RETENTION_DAYS` env var |
-| JavaScript file hashes | Same as evidence | Derived from evidence retention |
-| DNS records | Until asset removed | Marked `removed_at`; purged after 90 days |
-| Certificates | Until asset removed | Marked `removed_at`; purged after 90 days |
-| Notifications | 90 days | (configurable per-integration) |
-| API tokens | Configurable, max 90 days | `expires_at` column |
-| Reports | 365 days | R2 lifecycle rule |
-| Provider cache (KV) | 5 minutes | `expirationTtl` on KV puts |
+Retention constants live in `src/constants.ts` (`LIMITS`); purge runs once an
+hour on the cron tick (`minuteOfDay % 60 === 0`).
 
-## Per-organization overrides
+## Deletion
 
-Organizations can override the defaults via the `retention_policies` table:
+- `/remove <domain>` — `DELETE FROM targets` cascades to scopes, assets
+  (+ everything keyed by them), scans, findings, and feature toggles. The
+  domain's KV cursors stop being updated (orphaned keys expire by non-use;
+  they hold only cursors, no content).
+- Deleting a **category** (`target_groups` row) only detaches its domains
+  (`ON DELETE SET NULL`) — domains and their data are never deleted with it.
+- Notifications are *not* tied to a target FK; they age out on the 30-day
+  purge.
 
-```sql
-INSERT INTO retention_policies (id, organization_id, data_class, retention_days)
-VALUES ('rp_1', 'ORG_xxx', 'evidence', 90);
+## What is never stored
+
+- Secret values — only salted fingerprints (see SECURITY.md)
+- Full HTTP response bodies from fuzzing (only status/length/title/hash)
+- Credentials, cookies, or authorization headers on outbound requests
+
+## Manual purge (if you need it now)
+
+```bash
+npx wrangler d1 execute watchtower-db --remote --command \
+  "DELETE FROM job_queue WHERE status IN ('completed','failed','cancelled','dead_letter') AND created_at < date('now','-7 day');"
+npx wrangler d1 execute watchtower-db --remote --command \
+  "DELETE FROM notifications WHERE created_at < date('now','-30 day');"
 ```
-
-Valid `data_class` values: `evidence`, `findings`, `audit`, `javascript`,
-`dns`, `certificates`, `reports`.
-
-## Deletion process
-
-A scheduled cron job (configured in `wrangler.toml` under `[triggers]`)
-runs daily to purge expired data:
-
-1. **Evidence**: list R2 objects with `expires-at` metadata older than
-   today; delete each. This is a hard delete (no soft-delete layer).
-2. **DNS/certificates**: rows with `removed_at` older than 90 days are
-   hard-deleted via `DELETE FROM ... WHERE removed_at < ?`.
-3. **Audit logs**: rows older than `AUDIT_RETENTION_DAYS` are deleted.
-4. **Notifications**: rows older than 90 days are deleted.
-5. **API tokens**: rows with `expires_at < now()` are deleted.
-6. **Provider cache**: KV TTLs handle this automatically.
-
-## Right to be forgotten
-
-Operators can request deletion of a target's entire footprint:
-
-1. `DELETE FROM targets WHERE id = ?` cascades to scope_entries, assets,
-   dns_records, certificates, services, technologies, javascript_files,
-   javascript_diffs, api_endpoints, scans, scan_jobs, scan_results,
-   findings, finding_evidence, finding_comments, finding_history, changes,
-   schedules, reports.
-2. R2 evidence under `evidence/<org_id>/<target_id>/` is deleted via a
-   `list` + `delete` loop.
-
-This operation is **irreversible** and is audit-logged.
-
-## Legal hold
-
-When a legal hold is in place, set the `paused` flag on the target to
-prevent deletion. A documented exception process is required to override.

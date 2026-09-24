@@ -12,7 +12,7 @@ import { checkUrlInScope } from "./scope.js";
 import { parseIP, isPrivateOrReserved } from "../utils/ip.js";
 import { parseUrl } from "../utils/url.js";
 import { LIMITS } from "../constants.js";
-import { log } from "../audit/logger.js";
+import { log } from "../lib/console-logger.js";
 
 export interface SafeFetchOptions {
   method?: string;

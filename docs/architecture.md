@@ -2,195 +2,110 @@
 
 ## High-level design
 
-Watchtower is structured as a single Cloudflare Worker with multiple entry
-points (fetch, scheduled, queue) backed by Cloudflare bindings (D1, R2,
-KV, Queues, Durable Objects).
+One Cloudflare Worker, two entry points (`fetch`, `scheduled`), two bindings
+(D1 + KV). No Queues, no Durable Objects, no R2, no REST API.
 
 ```
-                          ┌──────────────────┐
-                          │  Telegram API    │
-                          └────────┬─────────┘
-                                   │ HTTPS webhook
-                                   ▼
+                       ┌──────────────────┐
+                       │   Telegram API   │
+                       └────────┬─────────┘
+                                │ HTTPS webhook (secret-token verified)
+                                ▼
         ┌───────────────────────────────────────────────────┐
-        │              Cloudflare Worker                    │
-        │                                                  │
-        │  fetch ──┬─ /telegram → handleTelegramWebhook    │
-        │          ├─ /v1/*      → REST API                 │
-        │          └─ /health    → status probe             │
-        │                                                  │
-        │  scheduled ─► handleScheduled (cron tick)        │
-        │                                                  │
-        │  queue ────┬─ SCAN_QUEUE   → handleScanMessage   │
-        │            └─ NOTIFY_QUEUE → handleNotification   │
-        │                                                  │
-        │  DO classes: EmergencyStopDO, LockDO,             │
-        │              RateLimiterDO                       │
-        │                                                  │
-        │  Bindings: D1, R2, KV, Queues                    │
-        └──────────────────────────────────────────────────┘
-                          │
-                          ▼
-        ┌──────────────────────────────────────────────────┐
-        │  External scanner runners (HMAC-signed jobs)      │
-        │  Container | Cloud Run | Fly.io | Lambda | GH-A   │
-        │  nmap, subfinder, amass, httpx, nuclei, zap, burp │
-        └──────────────────────────────────────────────────┘
+        │                Cloudflare Worker                  │
+        │                                                   │
+        │  fetch ──┬─ /telegram → allowlist → commands      │
+        │          ├─ / , /health → static JSON             │
+        │          └─ * → 404                               │
+        │                                                   │
+        │  scheduled (every 5 min) ─► cron/handler.ts       │
+        │      1. send pending Telegram notifications       │
+        │      2. run ≤2 scan jobs (D1 job_queue)           │
+        │      3. enqueue scans for targets older than      │
+        │         PASSIVE_RESCAN_MINUTES                    │
+        │      4. hourly: purge old jobs + notifications    │
+        └───────────────────────────────────────────────────┘
+                                │
+              D1 (targets, scopes, assets, scans,
+                  findings, job_queue, notifications,
+                  target_features, locks)   KV (cursors,
+                                             wildcard cache)
 ```
 
-## Request lifecycle: Telegram scan command
+## Scan pass (`runScanForTarget`)
+
+One bounded pass per target per invocation, gated by the per-domain feature
+map and a wall-clock deadline:
 
 ```
-User: /scan_passive TGT_xxx
-   │
-   ▼
-[Telegram webhook] ──► verifyWebhookSignature
-   │                    ✓ secret matches TELEGRAM_WEBHOOK_SECRET
-   ▼
-[Telegram commands router] ──► parse "/scan_passive" + arg
-   │
-   ▼
-[Check AUTHORIZED_TELEGRAM_IDS allowlist]
-   │
-   ▼
-[Audit-log the command] ──► D1.audit_logs INSERT
-   │
-   ▼
-[Check emergency stop] ──► EmergencyStopDO.fetch("check","target",id)
-   │                       (fail-closed if blocked)
-   ▼
-[Insert scan row] ──► D1.scans INSERT status='queued'
-   │
-   ▼
-[Enqueue job] ──► SCAN_QUEUE.send({...})
-   │
-   ▼
-[Ack Telegram] ◄── 200 OK (within 1s of receiving the update)
-
-[SCAN_QUEUE consumer (async)]
-   │
-   ▼
-[Load target + scope] ──► D1.targets + D1.scope_entries
-   │
-   ▼
-[Compile scope] ──► CompiledScope (regex/cidr/url rules)
-   │
-   ▼
-[Acquire per-target lock] ──► LockDO.acquire(ttl=5min)
-   │
-   ▼
-[Update scan status='running']
-   │
-   ▼
-[Run providers in bounded concurrency (max 5)]
-   │  ├─ CrtShProvider.discover()
-   │  ├─ CertSpotterProvider.discover()
-   │  ├─ CrtndstryProvider.discover()
-   │  └─ DohProvider.discover()
-   │
-   ▼
-[For each discovered asset:]
-   │  ├─ Validate host against scope
-   │  ├─ upsertAsset(...) → D1.assets INSERT/UPDATE
-   │  └─ If certificate: upsertCertificate(...)
-   │
-   ▼
-[For each in-scope subdomain:]
-   │  ├─ HttpxProvider.probeUrl()
-   │  │   └─ safeFetch() (SSRF-guarded)
-   │  ├─ upsertAsset(url)
-   │  └─ analyzeJsForAsset()
-   │      ├─ extract <script src> from HTML
-   │      ├─ For each JS URL:
-   │      │   ├─ safeFetch (bounded to 2 MiB)
-   │      │   ├─ sha256 hash
-   │      │   ├─ upsertJavascriptFile (diff against previous)
-   │      │   ├─ extractEndpoints (regex)
-   │      │   └─ redactWithFingerprints (secrets → fingerprint only)
-   │
-   ▼
-[Update scan status='completed'] ──► D1 UPDATE
-   │
-   ▼
-[Audit-log completion]
-   │
-   ▼
-[Release lock] ──► LockDO.release()
+load target + scopes ─► compileScope (default-deny)
+        │
+        ▼
+per-target D1 lock (locks table) ── busy? → retry next tick
+        │
+        ▼
+① passive discovery        [subdomain_enum]
+   crt.sh / crtndstry / certspotter + DoH DNS records
+   → assets, certs, dns_records + alerts
+        │
+        ▼
+② bruteforce chunk         [dns_brute]
+   BRUTEFORCE_CHUNK names × BRUTEFORCE_CONCURRENCY DoH lookups
+   wildcard-DNS guard → KV cursor bf:<targetId>
+        │
+        ▼
+③ probe rotation (≤ PROBE_LIMIT_PER_SCAN per pass)
+   ORDER BY last_probed IS NULL DESC, last_probed ASC
+   per host:
+     checkHostInScope() FIRST (exclusions cost zero requests)
+     https probe, else http probe
+     service row + change alerts       [status_watch]
+     technologies + version change     [status_watch]
+     OSV CVE match per versioned tech  [status_watch]
+     JS discovery/hash/secrets         [js_changes]
+     fuzz chunk                        [fuzz_files] (+[deep_fuzz] on fresh hosts)
+     one rotated extra port            [port_watch]
+     set assets.last_probed = now
+        │
+        ▼
+return { alerts, stats } ─► caller decides delivery
 ```
 
-## Provider adapter pattern
+- **Cron path**: alerts → `notification` jobs (dedup_key) → dispatched on a
+  later tick to every allowlisted chat.
+- **`/scan` path** (inline): one summary + up to 8 high/critical alerts
+  immediately; **every** alert's dedup key is recorded as `sent` so the cron
+  never re-sends the baseline.
 
-Every recon source implements the same `ReconProvider` interface:
+## Job queue and locks
 
-```ts
-interface ReconProvider {
-  readonly name: string;
-  readonly kind: "certificate_transparency" | "dns" | "subdomain" | "http" | "scanner" | "cve" | "cloud";
-  discover(input: { host: string }, ctx: ProviderContext): Promise<ProviderResult>;
-}
-```
+- `job_queue` (D1): `scan` and `notification` kinds, priority + `dedup_key`,
+  attempts with backoff, `locked_until` for claim windows; stale claims are
+  auto-expired by the cron.
+- `locks` (D1): one row per target key with `locked_until` (ms epoch),
+  acquired via `INSERT … ON CONFLICT DO NOTHING`; expired locks can be stolen,
+  so a crashed pass never wedges a target.
 
-Providers are composed in `buildRegistry()` and invoked in bounded
-concurrency (max 5 simultaneous providers) by `runProviders()`. Provider
-failures are recorded but never treated as asset removals — only successful
-responses update the asset baseline.
+## Provider pattern
 
-## Memory safety
+CT/DNS/HTTP sources implement `ReconProvider` (`src/providers/types.ts`) and
+are composed by `buildRegistry()`; `runProviders()` caps concurrency at 5.
+A provider error is recorded as an error, **never** treated as an asset
+removal — only successful responses update the baseline.
 
-Cloudflare Workers have a 128 MB memory limit. Watchtower enforces:
+## Memory & size ceilings
 
-- Per-response byte ceiling (`MAX_RESPONSE_BYTES` = 5 MiB)
-- Per-CT-provider ceiling (`MAX_CERT_PROVIDER_RESPONSE_BYTES` = 25 MiB)
-- Per-JS-file ceiling (`MAX_JS_FILE_BYTES` = 2 MiB)
-- Bounded deduplication Sets (max 50,000 entries)
-- Streaming reads via `ReadableStream` readers
+- HTTP responses: `LIMITS.MAX_RESPONSE_BYTES` (5 MiB) via streaming abort
+- CT provider responses: 25 MiB; JS files: 2 MiB each, ≤50 per target
+- Fuzz/bruteforce work is chunked; cursors live in KV, state in D1
 
-Every `safeFetch()` call uses a streaming reader and aborts as soon as the
-ceiling is reached. The first `maxBytes` bytes are retained; the rest are
-discarded.
+## Data model (4 migration files + 2)
 
-## Emergency stop semantics
+`0001_core` targets / scopes(+denylist) / allowed_users / locks ·
+`0002_assets` assets / dns / certs / services / technologies / js / api ·
+`0003_scans_findings` scans / job_queue / findings ·
+`0004_notifications` notifications · `0005_target_features` per-domain
+toggles · `0006_target_groups` categories (`/target-add`, `/target-info`).
 
-The `EmergencyStopDO` Durable Object holds:
-
-- `global` flag (kills all scans)
-- `perOrganization` map
-- `perTarget` map
-- `perJob` map (cancellations)
-
-Every cron tick and every queue consumer checks the DO state before
-starting work. If blocked, the work is acked (skipped), NOT retried —
-fail-closed behavior.
-
-Auto-expiry: each activation has an optional TTL. On the next `check`,
-expired activations are cleared automatically.
-
-## External scanner runner protocol
-
-1. **Job signing** — Worker signs a `RunnerJobPayload` with HMAC-SHA256
-   using `API_HMAC_KEY`. The payload includes a 30-minute expiry.
-
-2. **Runner fetches** the next pending job (polling `/v1/runner/pending`).
-
-3. **Runner verifies** the HMAC signature. Reject if invalid or expired.
-
-4. **Runner executes** the tool with the allowlisted arguments only.
-   `validateToolArgs()` rejects any flag not in the tool's allowlist and
-   any value containing shell metacharacters (`; | & $ \` > < \n \r`).
-
-5. **Runner posts** the HMAC-signed result back to `/v1/runner/callback`.
-
-6. **Worker verifies** the signature, checks `scope_validation_passed`,
-   and persists the (redacted) output as evidence in R2.
-
-Compromised runners cannot forge results without `API_HMAC_KEY` (held as a
-Cloudflare secret). Compromised runners cannot exfiltrate other tenants'
-data because every job is target-scoped and every API call is org-scoped.
-
-## Multi-tenant isolation
-
-Every DB query is parameterized by `organization_id`. The `users` table
-couples Telegram identity to organization membership via the
-`memberships` table. RBAC roles (`owner`, `administrator`, `analyst`,
-`viewer`, `external_reviewer`) gate API endpoints in `api/router.ts` and
-Telegram commands in `telegram/commands.ts`.
+Categories are organizational only: scanning, exclusions and feature toggles
+always resolve to a **domain** row.

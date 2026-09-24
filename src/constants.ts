@@ -1,36 +1,20 @@
 // src/constants.ts
-// Global constants. Keep these conservative — they can be tightened per
-// target via scan profiles, but never loosened beyond these ceilings.
+// Global constants. Conservative ceilings so the free tier is never exceeded.
 
 export const LIMITS = {
   MAX_RESPONSE_BYTES: 5 * 1024 * 1024,          // 5 MiB hard ceiling per HTTP fetch
   MAX_CERT_PROVIDER_RESPONSE_BYTES: 25 * 1024 * 1024, // 25 MiB ceiling for CT JSON
   MAX_JS_FILE_BYTES: 2 * 1024 * 1024,            // 2 MiB per JS file
-  MAX_JS_FILES_PER_TARGET: 500,
-  MAX_WORDLIST_ENTRIES: 50_000,
+  MAX_JS_FILES_PER_TARGET: 50,
   MAX_WORDLIST_ENTRY_LENGTH: 256,
   MAX_REQUEST_TIMEOUT_MS: 30_000,
   MAX_CONCURRENT_SCANS: 5,
-  MAX_CONCURRENT_HTTP_PER_HOST: 3,
   MAX_QUEUE_RETRIES: 5,
-  MAX_AUDIT_RECORD_PER_COMMAND: 1,
   MAX_TELEGRAM_MESSAGE_BYTES: 3500,              // Telegram hard limit is 4096
-  EVIDENCE_RETENTION_DAYS: 180,
-  AUDIT_RETENTION_DAYS: 730,
-  SCOPE_EXPIRY_WARNING_DAYS: 7,
-  DEFAULT_RATE_LIMIT_PER_MINUTE: 60,
-  EMERGENCY_STOP_TTL_HOURS: 24,
+  NOTIFICATION_DEDUPE_WINDOW_HOURS: 24 * 7,      // a change is reported once per week
+  JOB_RETENTION_DAYS: 7,
+  NOTIFICATION_RETENTION_DAYS: 30,
 } as const;
-
-// src/constants.ts
-// Global constants. Keep these conservative — they can be tightened per
-// target via scan profiles, but never loosened beyond these ceilings.
-//
-// NOTE: Severity, VerificationState, FindingStatus, ScanProfile types now
-// live in src/types.ts (v2 consolidation). They are re-exported here for
-// backwards compatibility with modules that import from constants.
-
-export type { Severity, VerificationState, FindingStatus, ScanProfile } from "./types.js";
 
 export const SEVERITY = {
   INFO: "informational",
@@ -40,45 +24,7 @@ export const SEVERITY = {
   CRITICAL: "critical",
 } as const;
 
-export const SEVERITY_RANK: Record<"informational" | "low" | "medium" | "high" | "critical", number> = {
-  informational: 0,
-  low: 1,
-  medium: 2,
-  high: 3,
-  critical: 4,
-};
-
-export const VERIFICATION_STATE = {
-  DETECTED: "detected",
-  SUSPECTED: "suspected",
-  VERIFIED: "verified",
-  CONFIRMED_HUMAN: "confirmed_human",
-  FALSE_POSITIVE: "false_positive",
-  REJECTED: "rejected",
-} as const;
-
-export const FINDING_STATUS = {
-  OPEN: "open",
-  ASSIGNED: "assigned",
-  IN_REVIEW: "in_review",
-  RESOLVED: "resolved",
-  CLOSED: "closed",
-  REOPENED: "reopened",
-} as const;
-
-export const SCAN_PROFILE = {
-  PASSIVE_ONLY: "passive-only",
-  LOW_IMPACT_WEB: "low-impact-web-content",
-  LOW_IMPACT_API: "low-impact-api-discovery",
-  JS_MONITORING: "javascript-monitoring",
-  SUBDOMAIN_MONITORING: "subdomain-monitoring",
-  TECH_SPECIFIC: "technology-specific",
-  CUSTOM_AUTHORIZED: "custom-authorized",
-  FULL_APPROVED: "full-approved-monitoring",
-} as const;
-
-export const HTTP_METHODS_SAFE = ["GET", "HEAD"] as const;
-export const HTTP_METHODS_INTRUSIVE = ["POST", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE"] as const;
+export type Severity = "informational" | "low" | "medium" | "high" | "critical";
 
 // Banned destination networks for SSRF protection.
 export const BLOCKED_CIDRS = [
@@ -119,50 +65,18 @@ export const BLOCKED_HOSTNAMES = new Set([
 
 export const ALLOWED_PORTS = new Set([80, 443, 8080, 8443, 3000, 5000, 8000, 8888]);
 
-// Telegram command surface
+// Telegram command surface — the entire UX of the bot.
 export const COMMANDS = [
-  { command: "start",            description: "Initialize the bot and view the welcome screen" },
-  { command: "help",            description: "List available commands" },
-  { command: "authorize",        description: "Confirm target ownership or written testing permission" },
-  { command: "scope_add",       description: "Add a new in-scope entry" },
-  { command: "scope_list",      description: "List all configured scope entries" },
-  { command: "scope_update",    description: "Update an existing scope entry" },
-  { command: "scope_remove",    description: "Remove a scope entry" },
-  { command: "scope_pause",     description: "Pause a scope entry" },
-  { command: "scope_resume",    description: "Resume a paused scope entry" },
-  { command: "scope_expire",    description: "Force-expire a scope entry" },
-  { command: "target_add",      description: "Add a monitoring target" },
-  { command: "target_list",     description: "List all targets" },
-  { command: "target_details",  description: "View a target's details" },
-  { command: "target_pause",    description: "Pause monitoring for a target" },
-  { command: "target_resume",   description: "Resume monitoring for a target" },
-  { command: "scan_passive",     description: "Run a passive scan" },
-  { command: "scan_active",     description: "Run a low-impact active scan (requires approval)" },
-  { command: "scan_status",     description: "View the status of in-flight scans" },
-  { command: "scan_cancel",     description: "Cancel a scan" },
-  { command: "scan_history",    description: "View scan history" },
-  { command: "findings_list",   description: "List findings" },
-  { command: "finding_details", description: "View a finding's details" },
-  { command: "finding_verify",   description: "Mark a finding as verified" },
-  { command: "finding_reject",   description: "Reject a finding as false positive" },
-  { command: "finding_assign",   description: "Assign a finding to a user" },
-  { command: "finding_close",    description: "Close a finding" },
-  { command: "finding_reopen",   description: "Reopen a finding" },
-  { command: "report_create",   description: "Generate a report" },
-  { command: "report_export",   description: "Export a report as Markdown / JSON / PDF" },
-  { command: "diff_latest",     description: "View the latest changes for a target" },
-  { command: "diff_compare",    description: "Compare two snapshots" },
-  { command: "alerts_enable",   description: "Enable alerts for a target" },
-  { command: "alerts_disable",  description: "Disable alerts for a target" },
-  { command: "schedule_add",    description: "Add a monitoring schedule" },
-  { command: "schedule_list",   description: "List schedules" },
-  { command: "schedule_remove", description: "Remove a schedule" },
-  { command: "integration_add",    description: "Add a notification integration" },
-  { command: "integration_remove", description: "Remove an integration" },
-  { command: "settings",       description: "View and edit user settings" },
-  { command: "team_invite",     description: "Invite a teammate" },
-  { command: "team_members",   description: "List team members" },
-  { command: "audit",          description: "View the audit log" },
-  { command: "stop",           description: "EMERGENCY STOP — cancel all scheduled jobs" },
-  { command: "resume",         description: "Resume after an emergency stop" },
+  { command: "start",   description: "Initialize the bot and view the welcome screen" },
+  { command: "help",    description: "List available commands" },
+  { command: "target_add", description: "Create a target category, e.g. /target-add shop" },
+  { command: "target_info", description: "Show a category and its domains: /target-info <category>" },
+  { command: "add",     description: "Add a domain to monitor: /add <domain> [category]" },
+  { command: "exclude", description: "Exclude a subdomain/path from scanning, e.g. /exclude sub.example.com" },
+  { command: "scan",    description: "Start an initial scan now, e.g. /scan example.com" },
+  { command: "feature", description: "List or toggle a domain's monitoring features: /feature <domain> [key on|off]" },
+  { command: "list",    description: "List categories, domains, exclusions and asset counts" },
+  { command: "remove",  description: "Stop monitoring a domain, e.g. /remove example.com" },
+  { command: "allow",   description: "Allow another Telegram user to use this bot: /allow <telegram_id>" },
+  { command: "disallow", description: "Revoke a user's access: /disallow <telegram_id>" },
 ] as const;

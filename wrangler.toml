@@ -31,35 +31,34 @@ invocation_logs = true
 # ---------------------------------------------------------------------------
 [vars]
 WATCHTOWER_ENV = "production"
-MAX_RESPONSE_BYTES = "1048576"            # 1 MiB (down from 5 MiB paid tier)
-MAX_JS_FILE_BYTES = "524288"               # 512 KiB per JS file
-MAX_JS_FILES_PER_ASSET = "20"              # down from 200
-MAX_CERTIFICATE_RESULTS = "500"            # down from 2000
-MAX_WORDLIST_ENTRIES = "5000"              # down from 50000
-MAX_WORDLIST_WORD_LENGTH = "256"
-DEFAULT_REQUEST_TIMEOUT_MS = "8000"        # 8s per request (down from 15s)
-MAX_JOBS_PER_TARGET = "1"                  # strictly serial (free tier)
-GLOBAL_RATE_LIMIT_PER_MINUTE = "30"       # down from 120
-TELEGRAM_UPDATE_MAX_BYTES = "65536"
-REQUIRE_HUMAN_APPROVAL_DEFAULT = "true"
-PASSIVE_ONLY_DEFAULT = "true"
-INTRUSIVE_TESTING_ENABLED = "false"
-WORDLIST_MODULE_ENABLED = "false"
-EVIDENCE_RETENTION_DAYS = "90"             # down from 365
-JS_SNAPSHOT_RETENTION_DAYS = "30"          # down from 180
-AUDIT_RETENTION_DAYS = "90"                # down from 730
-ALERT_BATCH_LOW_SEVERITY = "true"
-USER_AGENT = "Watchtower/3.0-free (+authorized-security-monitoring)"
-SCOPE_EXPIRY_WARNING_DAYS = "7"
-# Free-tier CPU/job bounds
-FREE_TIER_MAX_CPU_MS = "10"                # free-tier hard ceiling per invocation
-FREE_TIER_MAX_JOBS_PER_CRON = "2"          # scan jobs per cron
-FREE_TIER_MAX_NOTIFICATIONS_PER_CRON = "10" # notification jobs per cron
-FREE_TIER_SCAN_TIMEOUT_MS = "60000"        # 60s wall-clock per scan job
+USER_AGENT = "Watchtower/4.0 (bug-bounty-monitoring)"
+
+# Free-tier job bounds
+FREE_TIER_MAX_JOBS_PER_CRON = "2"            # scan jobs claimed per cron tick
+FREE_TIER_MAX_NOTIFICATIONS_PER_CRON = "10"  # notification jobs per tick
+FREE_TIER_SCAN_TIMEOUT_MS = "60000"          # wall-clock budget per scan job
+
+# Scan pipeline tuning
+PASSIVE_RESCAN_MINUTES = "30"     # how often each target is re-scanned
+BRUTEFORCE_CHUNK = "300"          # subdomain wordlist entries resolved per tick
+BRUTEFORCE_CONCURRENCY = "16"     # parallel DoH lookups during bruteforce
+PROBE_LIMIT_PER_SCAN = "5"        # HTTP probes (incl. JS + fuzz) per tick
+FUZZ_REQUESTS_PER_TICK = "40"     # wordlist fuzz requests per host per tick
 
 # ---------------------------------------------------------------------------
-# D1 — relational metadata + job_queue + findings + audit logs + evidence
-# (FREE: 5 GB, no payment method required)
+# Bundled wordlists are imported as text modules
+# (`import fuzzTxt from "../../fuzz-wordlists/fuzz.txt"`).
+# This rule makes Wrangler inline them instead of treating them as assets.
+# ---------------------------------------------------------------------------
+[[rules]]
+type = "Text"
+globs = ["**/fuzz-wordlists/*.txt"]
+fallthrough = false
+
+
+# ---------------------------------------------------------------------------
+# D1 — targets, scope/exclusions, assets, scans, findings, job queue,
+#      notification log (FREE: 5 GB, no payment method required).
 # ---------------------------------------------------------------------------
 [[d1_databases]]
 binding = "DB"
@@ -67,30 +66,12 @@ database_name = "watchtower-db"
 database_id = ""
 migrations_dir = "migrations"
 
-# ---------------------------------------------------------------------------
-# R2 — OPTIONAL on the free tier.
-#
-# R2's free tier (10 GB storage) is technically $0/month but Cloudflare
-# requires a payment method on file to enable R2 at all. If you don't want
-# to add a card, leave these commented out and Watchtower will store
-# encrypted evidence + reports as TEXT in the D1 database instead.
-#
-# To use R2 (recommended if you have a payment method on file):
-#   1. Enable R2 in the Cloudflare dashboard
-#   2. Uncomment the blocks below
-#   3. Run: wrangler r2 bucket create watchtower-evidence
-#          wrangler r2 bucket create watchtower-reports
-# ---------------------------------------------------------------------------
-# [[r2_buckets]]
-# binding = "EVIDENCE"
-# bucket_name = "watchtower-evidence"
-#
-# [[r2_buckets]]
-# binding = "REPORTS"
-# bucket_name = "watchtower-reports"
+# NOTE: R2 is not used at all anymore — the report/evidence features that needed
+# it are gone. Findings and notification history live in D1 only.
 
 # ---------------------------------------------------------------------------
-# KV — non-critical cache only (FREE: 100k reads + 1k writes/day)
+# KV — cursors (subdomain bruteforce + fuzz wordlists) and the wildcard-DNS
+#      cache (FREE: 100k reads + 1k writes/day)
 # ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "CACHE"
@@ -99,7 +80,7 @@ preview_id = ""
 
 # ---------------------------------------------------------------------------
 # SINGLE Cron Trigger — free tier allows only 1 per worker.
-# Internal handler in src/cron/handler.ts dispatches based on time-of-day.
+# src/cron/handler.ts runs the whole pipeline on this tick.
 # ---------------------------------------------------------------------------
 [triggers]
 crons = ["*/5 * * * *"]  # every 5 minutes
@@ -109,12 +90,8 @@ crons = ["*/5 * * * *"]  # every 5 minutes
 # ---------------------------------------------------------------------------
 # TELEGRAM_BOT_TOKEN
 # TELEGRAM_WEBHOOK_SECRET
-# AUTHORIZED_TELEGRAM_IDS (comma-separated allowlist during bootstrap)
-# API_HMAC_KEY
-# ENCRYPTION_KEY (32 bytes base64 — for AES-GCM at-rest encryption)
-# REDACTION_SALT (32 bytes hex — used to salt secret fingerprints)
-# WEBHOOK_SIGNING_SECRET
-# RUNNER_REGISTRY_TOKEN
+# AUTHORIZED_TELEGRAM_IDS (comma-separated bootstrap allowlist; extend with /allow)
+# REDACTION_SALT (any long random string — salts secret fingerprints)
 
 # ---------------------------------------------------------------------------
 # Dev overrides (local `wrangler dev`)
@@ -126,3 +103,4 @@ workers_dev = true
 [env.dev.vars]
 WATCHTOWER_ENV = "dev"
 FREE_TIER_MAX_JOBS_PER_CRON = "1"
+FREE_TIER_MAX_NOTIFICATIONS_PER_CRON = "5"

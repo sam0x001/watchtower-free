@@ -1,88 +1,95 @@
-# Watchtower — Incident Response Procedure
+# Watchtower — Incident Response
 
 ## When to invoke
 
-Invoke this procedure when any of the following occur:
+1. The bot scanned or probed something you did not intend to (exclusion
+   missed, wrong domain added).
+2. A secret value appeared in a Telegram message or in the `notifications`
+   table.
+3. Someone who should not have access issued commands (allowlist too wide,
+   account compromised).
+4. The bot is flooding a target or Telegram (runaway scan, retry storm).
+5. The webhook secret or bot token leaked.
 
-1. An unauthorized target was added or scanned.
-2. A scan went out of scope (e.g., a redirect leaked to a third party).
-3. An emergency-stop was triggered by an automated check.
-4. A suspected secret was found in logs or notifications.
-5. A scanner runner appears compromised.
-6. A breach of the encrypted evidence store is suspected.
+## Severity
 
-## Severity classification
+| Level | Definition | Example |
+|---|---|---|
+| SEV-0 | Out-of-scope activity against a third party | Redirect chased to a non-target host |
+| SEV-1 | Secret material exposed | Full API key in a chat message |
+| SEV-2 | Unauthorized operator access | Ex-allowlisted account issued `/remove` |
+| SEV-3 | Noise / self-DoS | Retry storm against your own target |
 
-| Level | Definition | Examples |
-|-------|------------|----------|
-| SEV-0 | Critical — active unauthorized scanning | Operator scanned third-party infrastructure without authorization |
-| SEV-1 | High — secrets leaked in logs/notifications | Telegram message contained a full API key |
-| SEV-2 | Medium — out-of-scope asset briefly probed | A redirect from in-scope asset to third party was followed |
-| SEV-3 | Low — evidence of policy violation | Scope was added without recorded authorization |
+## Steps
 
-## Response steps
+### 1 — Stop (≤ 5 minutes)
 
-### Step 1 — Stop the bleeding (≤ 5 minutes)
+- Wrong domain: `/remove <domain>` (cascades all stored data for it).
+- Wrong subdomain/path only: `/exclude <domain> <value>` — applied **before
+  any request**, so it takes effect on the next probe/fuzz/bruteforce lookup.
+- Whole target paused but keep data: `wrangler d1 execute … "UPDATE targets SET status='paused' …"`.
+- Unauthorized user: `/disallow <telegram_id>`; if the leak is the bot
+  itself, disable the webhook:
+  `curl -X POST "https://api.telegram.org/bot<TOKEN>/deleteWebhook"`.
+- Retry storm / flooding: pause the target (above) — queued scan jobs for
+  paused targets are dropped without retry by the runner.
 
-1. Issue `/stop global` via Telegram to cancel all running scans.
-2. Verify the emergency stop is active via `GET https://watchtower.example.workers.dev/v1/health`.
-3. Pause every target: `UPDATE targets SET paused = 1`.
-4. Revoke any suspect API tokens via the database.
-5. If a runner is suspected compromised, revoke it:
-   `UPDATE runners SET revoked = 1, revoked_reason = 'incident-<id>' WHERE id = ?`.
+### 2 — Contain (≤ 30 minutes)
 
-### Step 2 — Contain (≤ 30 minutes)
+```bash
+# What did it touch? (last 24h of notifications, redacted bodies)
+npx wrangler d1 execute watchtower-db --remote --command \
+  "SELECT created_at, alert_type, severity, title FROM notifications ORDER BY created_at DESC LIMIT 100;"
 
-1. Identify the scope of impact:
-   - Which targets were affected?
-   - Which findings were generated?
-   - Which notifications were sent?
-2. Pull the audit log for the affected time window:
-   `SELECT * FROM audit_logs WHERE created_at > ? ORDER BY created_at DESC LIMIT 1000`.
-3. Snapshot the D1 database: `wrangler d1 export watchtower-db --remote > snapshot.sql`.
-4. Snapshot R2 evidence: list objects under `evidence/` for the affected orgs.
+# What ran?
+npx wrangler d1 execute watchtower-db --remote --command \
+  "SELECT id, kind, status, attempts, last_error FROM job_queue WHERE created_at > datetime('now','-1 day');"
 
-### Step 3 — Eradicate (≤ 4 hours)
+# Snapshot the database
+npx wrangler d1 export watchtower-db --remote > snapshot-INC.sql
+```
 
-1. Delete any unauthorized scope entries.
-2. Revoke the compromised operator's access.
-3. Rotate `ENCRYPTION_KEY`, `API_HMAC_KEY`, `WEBHOOK_SIGNING_SECRET`,
-   `RUNNER_REGISTRY_TOKEN`, and any leaked third-party credentials.
-4. Re-encrypt affected evidence with the new `ENCRYPTION_KEY` (requires a
-   one-off rotation script — see `scripts/rotate-encryption-key.ts`).
+### 3 — Eradicate (≤ 4 hours)
 
-### Step 4 — Recover (≤ 24 hours)
+Rotate the compromised secrets (exactly four exist):
 
-1. Re-add authorized targets and scope.
-2. Resume monitoring via `/resume`.
-3. Run a baseline passive scan to verify the platform is functional.
-4. Notify affected program owners / clients if their scope was impacted.
+```bash
+npx wrangler secret put TELEGRAM_BOT_TOKEN        # new token from @BotFather if leaked
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET   # any long random string
+npx wrangler secret put AUTHORIZED_TELEGRAM_IDS   # rebuild the allowlist
+npx wrangler secret put REDACTION_SALT            # NOTE: changes future fingerprints
+```
+> Rotating `REDACTION_SALT` invalidates cross-comparison with fingerprints
+> recorded under the old salt — previously seen secrets may re-alert once.
 
-### Step 5 — Postmortem (≤ 7 days)
+Then `npx wrangler deploy` (secrets apply on next deploy/restart) and
+re-register the webhook (see DEPLOYMENT.md, Step 4).
 
-1. Document the timeline, root cause, and lessons learned.
-2. Update the threat model (`docs/threat-model.md`).
-3. Add new test cases to prevent regression.
-4. File improvement tickets for any control gaps.
+### 4 — Recover (≤ 24 hours)
+
+1. Re-add legitimate domains: `/add <domain> [category]`.
+2. Run `/scan <domain>` and confirm the summary looks right.
+3. Re-enable `/feature` flags you disabled during containment.
+4. Notify the affected program owner if their scope was touched (template
+   below).
+
+### 5 — Postmortem (≤ 7 days)
+
+Document timeline + root cause, add a regression test (the suite is
+`npm test` — 18 files), and update `docs/threat-model.md`.
 
 ## Communication templates
 
-### Initial notification (internal)
+**Internal**
 
-> Incident ID: INC-YYYYMMDD-NNN
-> Detected at: <ISO timestamp>
-> Severity: SEV-N
-> Summary: <one-paragraph description>
-> Containment status: <in progress / contained / resolved>
-> Owner: <on-call engineer>
+> Incident: INC-YYYYMMDD-NNN · SEV-N
+> Detected: <ISO time> · Contained: <yes/no>
+> Summary: <one paragraph> · Owner: <name>
 
-### External notification (to affected program owner)
+**External (program owner)**
 
-> Watchtower security incident notification
->
-> We detected unauthorized activity affecting your authorized scope on
-> <date>. As a precaution we have paused all monitoring of your targets
-> and are conducting a full investigation. We will share a detailed
-> postmortem within 7 business days.
->
-> If you have questions, contact <security-contact@your-org>.
+> We detected monitoring activity affecting your program's scope on <date>
+> that was not intended. We paused it immediately (<action taken>) and are
+> reviewing our configuration. No intrusive testing (exploitation, credential
+> use, destructive actions) was performed — Watchtower only issues GET/HEAD
+> requests and passive DNS/CT lookups. Contact: <your address>

@@ -11,7 +11,7 @@
 //                     ↘ cancelled (operator-cancelled)
 //                     ↘ dead_letter (max attempts exceeded)
 
-export type JobKind = "scan" | "notification" | "report";
+export type JobKind = "scan" | "notification";
 export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancelled" | "dead_letter";
 
 export interface JobRow {
@@ -33,7 +33,6 @@ export interface JobRow {
 
 export const MAX_SCAN_ATTEMPTS = 3;
 export const MAX_NOTIFICATION_ATTEMPTS = 5;
-export const MAX_REPORT_ATTEMPTS = 2;
 
 /**
  * Insert a job row. If `dedup_key` is provided and a pending/running job with
@@ -63,7 +62,7 @@ export async function enqueueJob(
 
   const id = `job_${crypto.randomUUID()}`;
   const now = new Date();
-  const maxAttempts = opts.max_attempts ?? (kind === "scan" ? MAX_SCAN_ATTEMPTS : kind === "notification" ? MAX_NOTIFICATION_ATTEMPTS : MAX_REPORT_ATTEMPTS);
+  const maxAttempts = opts.max_attempts ?? (kind === "scan" ? MAX_SCAN_ATTEMPTS : MAX_NOTIFICATION_ATTEMPTS);
   const runAfter = (opts.run_after ?? now).toISOString();
   const lockedUntil = new Date(0).toISOString(); // epoch = not locked
 

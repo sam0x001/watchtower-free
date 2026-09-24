@@ -1,5 +1,49 @@
 # Changelog
 
+## v4.0.0-free — scope-exclude model, chunked scanning, Telegram-only alerts
+
+Breaking change from the 3.x line:
+
+- Targets are public bug bounty programs: the authorization/target-ownership
+  workflow is gone. `/add example.com` implies `*.example.com` — all
+  subdomains are in scope. Monitoring ends only with `/remove`.
+- Scope is now **exclusion-based**: `/exclude` skips a subdomain, a
+  `*.wildcard` or a `domain/path` (denylist; checked before any network call).
+- Kept capabilities only: subdomain enumeration (CT + DNS + wordlist
+  bruteforce), asset/JS discovery, sensitive-data fuzzing with
+  `fuzz-wordlists/`, technology fingerprinting + CVE matching (OSV.dev).
+  Reports, integrations, REST API, emergency stop, runners, audit logs and
+  evidence storage are removed.
+- `/scan <domain>` runs an initial scan inline (summary + high/critical
+  alerts in chat); the 5-minute cron keeps watching and reports only new
+  findings. Every new asset/change of any kind notifies over Telegram.
+- Chunked for the Workers free plan: CT/DNS providers stay fast third-party
+  calls; bruteforce + fuzzing advance a bounded slice per tick with KV
+  cursors; HTTP probes rotate via `assets.last_probed`; per-target D1 locks.
+- Wildcard-DNS false-positive guard: gibberish-resolving domains are treated
+  as wildcarded; bruteforce hits resolving only to wildcard IPs are dropped.
+- Schema incompatible with 3.x: separate migration files (`0001_core` …
+  `0006_target_groups`); the deployment guide tells you to recreate the
+  D1 database.
+- **Target categories**: `/target-add <name>` creates a category,
+  `/add <domain> <category>` files a domain under it, and
+  `/target-info <category>` lists every member with last scan, exclusions and
+  its feature count. Categories only organize domains — scanning, exclusions
+  and **feature toggles stay strictly per domain**. Deleting a category
+  detaches (never deletes) its domains.
+- Docs rewritten for v4: README, DEPLOYMENT, SECURITY, CHANGELOG,
+  `docs/architecture.md`, `docs/threat-model.md`, `docs/data-retention.md`,
+  `docs/incident-response.md`, `fuzz-wordlists/README.md`. Removed
+  `docs/openapi.yaml` (the REST API no longer exists) and root scratch files
+  (`d1-*.txt`, `jq-*.txt`, `tmp-*`, `prompt.txt`); `.gitignore` entries for
+  them dropped accordingly. The conflicted `fuzz-wordlists/subdomains.txt`
+  working-copy edit was backed up to the system temp dir and restored to the
+  committed 54-entry list.
+- Also fixed along the way: IPv4-mapped IPv6 parsing, unsigned-range SSRF
+  filtering (192.168/16, 169.254/16, 172.16/12, multicast…), per-label domain
+  validation, Google API key / PEM-block redaction, cyclic-structure depth
+  guard, and distinct `no_scope` / `blocked_ip_range` scope reasons.
+
 ## v3.0.0-free — runs on Cloudflare Workers FREE tier
 
 ### The change

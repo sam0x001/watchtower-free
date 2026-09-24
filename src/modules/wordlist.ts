@@ -1,7 +1,14 @@
 // src/modules/wordlist.ts
-// Authorization-gated wordlist module. Disabled by default.
-// Validates every entry, prevents path traversal/SSRF, enforces per-target
-// rate limits, stops on 429/5xx/overload.
+// Sensitive-data / endpoint fuzzing with the bundled wordlists
+// (fuzz-wordlists/api.txt, directories.txt, files.txt, fuzz.txt).
+//
+// Free-tier aware: processes a bounded number of requests per host per tick
+// (FUZZ_REQUESTS_PER_TICK), throttled, stopping on 429/5xx streaks. Every
+// entry is sanitized (no traversal, no control chars) and scope-checked
+// (denylist exclusions honored) before any request is made.
+//
+// Findings (sensitive-looking responses: .env content, backups, admin panels,
+// exposed configs) are persisted in `findings` and alerted once.
 
 import type { Env } from "../env.js";
 import type { CompiledScope } from "../security/scope.js";
@@ -10,186 +17,41 @@ import { safeFetch } from "../security/ssrf.js";
 import { joinUrl } from "../utils/url.js";
 import { LIMITS } from "../constants.js";
 import { sha256 } from "../crypto/hash.js";
-import { randomId } from "../crypto/hash.js";
+import apiTxt from "../../fuzz-wordlists/api.txt";
+import directoriesTxt from "../../fuzz-wordlists/directories.txt";
+import filesTxt from "../../fuzz-wordlists/files.txt";
+import fuzzTxt from "../../fuzz-wordlists/fuzz.txt";
 
-export interface WordlistEntry {
-  value: string;
-  category: string;
-}
+import { buildAlert, type Alert } from "./alerts.js";
+import { insertFinding } from "../db/queries/findings.js";
 
-export interface WordlistProfile {
-  name: string;
-  categories: string[];
+export type FuzzCategory = "api" | "directories" | "files" | "fuzz";
+
+const WORDLISTS: Record<FuzzCategory, string> = {
+  api: apiTxt,
+  directories: directoriesTxt,
+  files: filesTxt,
+  fuzz: fuzzTxt,
+};
+
+export interface FuzzProfile {
+  categories: FuzzCategory[];
   maxRequests: number;
   maxConcurrency: number;
   delayMs: number;
-  jitterMs: number;
   timeoutMs: number;
   maxResponseBytes: number;
-  allowedStatusCodes: number[] | "all";
-  allowedContentTypes: string[] | "all";
-  redirectPolicy: "in_scope" | "none";
-  authenticationPolicy: "none";
-  notificationPolicy: "immediate" | "batch";
-  retentionDays: number;
-  requiresHumanApproval: boolean;
-  schedule: string;
-  stopConditions: string[];
+  stopOn429: boolean;
 }
 
-export const WORDLIST_PROFILES: Record<string, WordlistProfile> = {
-  "passive-only": {
-    name: "passive-only",
-    categories: [],
-    maxRequests: 0,
-    maxConcurrency: 1,
-    delayMs: 1000,
-    jitterMs: 500,
-    timeoutMs: 10000,
-    maxResponseBytes: 1 * 1024 * 1024,
-    allowedStatusCodes: [],
-    allowedContentTypes: [],
-    redirectPolicy: "none",
-    authenticationPolicy: "none",
-    notificationPolicy: "immediate",
-    retentionDays: 90,
-    requiresHumanApproval: false,
-    schedule: "daily",
-    stopConditions: ["429", "5xx_x3", "timeout_x3"],
-  },
-  "low-impact-web-content": {
-    name: "low-impact-web-content",
-    categories: ["directories", "files", "backup", "config", "documentation", "static"],
-    maxRequests: 200,
-    maxConcurrency: 2,
-    delayMs: 500,
-    jitterMs: 250,
-    timeoutMs: 10000,
-    maxResponseBytes: 1 * 1024 * 1024,
-    allowedStatusCodes: "all",
-    allowedContentTypes: "all",
-    redirectPolicy: "in_scope",
-    authenticationPolicy: "none",
-    notificationPolicy: "batch",
-    retentionDays: 90,
-    requiresHumanApproval: true,
-    schedule: "daily",
-    stopConditions: ["429", "5xx_x3", "timeout_x3", "403_x5"],
-  },
-  "low-impact-api-discovery": {
-    name: "low-impact-api-discovery",
-    categories: ["api", "api_version", "graphql", "openapi"],
-    maxRequests: 100,
-    maxConcurrency: 2,
-    delayMs: 800,
-    jitterMs: 400,
-    timeoutMs: 10000,
-    maxResponseBytes: 512 * 1024,
-    allowedStatusCodes: "all",
-    allowedContentTypes: "all",
-    redirectPolicy: "in_scope",
-    authenticationPolicy: "none",
-    notificationPolicy: "batch",
-    retentionDays: 90,
-    requiresHumanApproval: true,
-    schedule: "daily",
-    stopConditions: ["429", "5xx_x3", "timeout_x3"],
-  },
-  "javascript-monitoring": {
-    name: "javascript-monitoring",
-    categories: ["javascript", "sourcemap"],
-    maxRequests: 100,
-    maxConcurrency: 2,
-    delayMs: 400,
-    jitterMs: 200,
-    timeoutMs: 10000,
-    maxResponseBytes: 2 * 1024 * 1024,
-    allowedStatusCodes: "all",
-    allowedContentTypes: ["application/javascript", "text/javascript"],
-    redirectPolicy: "in_scope",
-    authenticationPolicy: "none",
-    notificationPolicy: "batch",
-    retentionDays: 90,
-    requiresHumanApproval: false,
-    schedule: "hourly",
-    stopConditions: ["429", "5xx_x3", "timeout_x3"],
-  },
-  "subdomain-monitoring": {
-    name: "subdomain-monitoring",
-    categories: ["subdomain"],
-    maxRequests: 0, // DNS-only
-    maxConcurrency: 1,
-    delayMs: 1000,
-    jitterMs: 500,
-    timeoutMs: 5000,
-    maxResponseBytes: 64 * 1024,
-    allowedStatusCodes: [],
-    allowedContentTypes: [],
-    redirectPolicy: "none",
-    authenticationPolicy: "none",
-    notificationPolicy: "immediate",
-    retentionDays: 90,
-    requiresHumanApproval: false,
-    schedule: "daily",
-    stopConditions: [],
-  },
-  "technology-specific": {
-    name: "technology-specific",
-    categories: ["tech_specific"],
-    maxRequests: 100,
-    maxConcurrency: 2,
-    delayMs: 600,
-    jitterMs: 300,
-    timeoutMs: 10000,
-    maxResponseBytes: 512 * 1024,
-    allowedStatusCodes: "all",
-    allowedContentTypes: "all",
-    redirectPolicy: "in_scope",
-    authenticationPolicy: "none",
-    notificationPolicy: "batch",
-    retentionDays: 90,
-    requiresHumanApproval: true,
-    schedule: "weekly",
-    stopConditions: ["429", "5xx_x3"],
-  },
-  "custom-authorized": {
-    name: "custom-authorized",
-    categories: ["custom"],
-    maxRequests: 50,
-    maxConcurrency: 1,
-    delayMs: 1000,
-    jitterMs: 500,
-    timeoutMs: 10000,
-    maxResponseBytes: 512 * 1024,
-    allowedStatusCodes: "all",
-    allowedContentTypes: "all",
-    redirectPolicy: "in_scope",
-    authenticationPolicy: "none",
-    notificationPolicy: "batch",
-    retentionDays: 30,
-    requiresHumanApproval: true,
-    schedule: "weekly",
-    stopConditions: ["429", "5xx_x3"],
-  },
-  "full-approved-monitoring": {
-    name: "full-approved-monitoring",
-    categories: ["directories", "files", "backup", "config", "api", "api_version", "graphql", "documentation", "static", "javascript", "sourcemap", "subdomain", "tech_specific", "custom"],
-    maxRequests: 500,
-    maxConcurrency: 2,
-    delayMs: 800,
-    jitterMs: 400,
-    timeoutMs: 10000,
-    maxResponseBytes: 2 * 1024 * 1024,
-    allowedStatusCodes: "all",
-    allowedContentTypes: "all",
-    redirectPolicy: "in_scope",
-    authenticationPolicy: "none",
-    notificationPolicy: "batch",
-    retentionDays: 90,
-    requiresHumanApproval: true,
-    schedule: "weekly",
-    stopConditions: ["429", "5xx_x3", "timeout_x3"],
-  },
+export const FUZZ_PROFILE: FuzzProfile = {
+  categories: ["api", "directories", "files", "fuzz"],
+  maxRequests: 200,
+  maxConcurrency: 2,
+  delayMs: 250,
+  timeoutMs: 8_000,
+  maxResponseBytes: 256 * 1024,
+  stopOn429: true,
 };
 
 export interface FuzzResult {
@@ -199,79 +61,8 @@ export interface FuzzResult {
   contentLength: number;
   title: string | null;
   bodyHash: string;
-  redirectChain: string[];
-  elapsedMs: number;
-  isNew: boolean;
   classification: string;
-}
-
-export async function runWordlist(
-  env: Env,
-  baseUrl: string,
-  scope: CompiledScope,
-  wordlist: string[],
-  profile: WordlistProfile,
-): Promise<FuzzResult[]> {
-  const results: FuzzResult[] = [];
-  let consecutiveErrors = 0;
-  let consecutiveTimeouts = 0;
-  let requestsMade = 0;
-
-  for (const entry of wordlist) {
-    if (requestsMade >= profile.maxRequests) break;
-    if (consecutiveErrors >= 5) break;
-    if (consecutiveTimeouts >= 3) break;
-
-    // Sanitize entry
-    const sanitized = sanitizeWordlistEntry(entry);
-    if (!sanitized) continue;
-
-    const url = joinUrl(baseUrl, sanitized);
-    if (!url) continue;
-    const scopeCheck = checkUrlInScope(scope, url);
-    if (!scopeCheck.allowed) continue;
-
-    try {
-      const r = await safeFetch(env, url, {
-        scope,
-        method: "GET",
-        timeoutMs: profile.timeoutMs,
-        maxBytes: profile.maxResponseBytes,
-        userAgent: env.USER_AGENT,
-        followRedirects: profile.redirectPolicy === "in_scope",
-      });
-      requestsMade++;
-      if (r.status === 429) { break; }
-      if (r.status >= 500) { consecutiveErrors++; continue; }
-      consecutiveErrors = 0;
-      consecutiveTimeouts = 0;
-
-      const text = new TextDecoder().decode(r.body);
-      const bodyHash = await sha256(text);
-      const title = (text.match(/<title[^>]*>([\s\S]{0,200}?)<\/title>/i)?.[1] ?? "").trim() || null;
-      results.push({
-        url,
-        status: r.status,
-        contentType: r.headers["content-type"] ?? null,
-        contentLength: r.body.byteLength,
-        title,
-        bodyHash,
-        redirectChain: r.finalUrl !== url ? [r.finalUrl] : [],
-        elapsedMs: r.elapsedMs,
-        isNew: true, // determined by caller against baseline
-        classification: classifyResponse(r.status, r.headers["content-type"] ?? "", title),
-      });
-
-      // Delay + jitter
-      const wait = profile.delayMs + Math.floor(Math.random() * profile.jitterMs);
-      await new Promise((resolve) => setTimeout(resolve, wait));
-    } catch (err) {
-      if (String(err).includes("timeout")) consecutiveTimeouts++;
-      consecutiveErrors++;
-    }
-  }
-
-  return results;
+  isSensitive: boolean;
 }
 
 export function sanitizeWordlistEntry(entry: string): string | null {
@@ -284,54 +75,165 @@ export function sanitizeWordlistEntry(entry: string): string | null {
   if (v.includes("\0")) return null;
   // NUL or control chars
   if (/[\x00-\x1f]/.test(v)) return null;
-  // URL-encode-safe: letters, digits, _ - / . ~ : @ ! $ & ' ( ) * + , ; =
+  // URL-encode-safe: letters, digits, _ - / . ~ : @ ! $ & ' ( ) * + , ; = %
   if (!/^[A-Za-z0-9_\-\/.~:@!$&'()*+,;=%]+$/.test(v)) return null;
   return v;
 }
 
-function classifyResponse(status: number, contentType: string, title: string | null): string {
-  if (status === 200) {
-    if (/application\/json/.test(contentType)) return "new_api_route";
-    if (/text\/html/.test(contentType) && title && /admin|login|dashboard/i.test(title)) return "new_admin_panel";
-    if (/\/\.env|\.config|\.bak|\.old|\.sql|\.zip|\.tar/.test("")) return "new_backup_file";
-    return "new_endpoint";
+/**
+ * Classification heuristics: which responses are worth alerting on?
+ * 404s and auth walls are ignored; interesting files (env/config/backup/
+ * admin/api responses) are flagged as sensitive.
+ */
+function classifyResponse(status: number, contentType: string, url: string, body: string): { classification: string; isSensitive: boolean } {
+  const ct = contentType.toLowerCase();
+  if (status === 404 || status === 410) return { classification: "not_found", isSensitive: false };
+  if (status === 401 || status === 403) return { classification: "auth_required", isSensitive: false };
+
+  const urlLc = url.toLowerCase();
+  const bodyLc = body.slice(0, 10_000).toLowerCase();
+
+  const sensitiveFilePatterns = [
+    /\.env($|\?)/, /\.git\//, /\.config($|\.)/, /\.bak($|\.)/, /\.old($|\.)/,
+    /\.sql($|\.)/, /\.zip($|\.)/, /\.tar($|\.gz$)/, /\.7z($|\.)/, /\.rar($|\.)/,
+    /backup/, /dump/, /id_rsa/, /\.pem($|\.)/, /\.key($|\.)/, /credentials/,
+    /phpinfo/, /\.ini($|\.)/, /web\.config/, /\.DS_Store/,
+  ];
+  if (sensitiveFilePatterns.some((re) => re.test(urlLc)) && status < 400) {
+    return { classification: "sensitive_file", isSensitive: true };
   }
-  if (status === 401 || status === 403) return "authentication_behavior_changed";
-  if (status === 404) return "false_positive";
-  if (status >= 300 && status < 400) return "redirect_changed";
-  return "requires_manual_review";
+
+  if (/\.env/.test(urlLc) && /(db_|database|password|secret|api[_-]?key)\s*=/.test(bodyLc)) {
+    return { classification: "exposed_environment", isSensitive: true };
+  }
+
+  if (status === 200 && /application\/(json|xml)/.test(ct)) {
+    return { classification: "new_api_route", isSensitive: true };
+  }
+
+  if (status === 200 && /text\/html/.test(ct)) {
+    const adminRe = /admin|login|dashboard|signin|console|cpanel|manager|wp-login/i;
+    if (adminRe.test(urlLc) || adminRe.test((body.match(/<title[^>]*>([\s\S]{0,200}?)<\/title>/i)?.[1] ?? ""))) {
+      return { classification: "admin_panel", isSensitive: true };
+    }
+    return { classification: "new_endpoint", isSensitive: false };
+  }
+
+  if (status >= 500) return { classification: "server_error", isSensitive: false };
+  return { classification: "requires_review", isSensitive: false };
 }
 
-export async function loadWordlist(db: D1Database, wordlistId: string): Promise<string[]> {
-  const r = await db.prepare(`SELECT r2_key FROM wordlists WHERE id = ?`).bind(wordlistId).first<{ r2_key: string }>();
-  if (!r) return [];
-  return [] as string[];
-}
-
-export async function storeWordlist(
-  db: D1Database,
-  orgId: string | null,
-  name: string,
-  category: string,
-  source: string,
-  entries: string[],
-): Promise<{ id: string; accepted: number; rejected: number; checksum: string }> {
-  const accepted: string[] = [];
-  let rejected = 0;
+/**
+ * Fuzz one host with the next slice of wordlist entries. `offset` is the
+ * per-host cursor (kept by the caller in KV); returns the new offset.
+ */
+export async function runFuzzChunk(
+  env: Env,
+  baseUrl: string,
+  targetId: string,
+  scope: CompiledScope,
+  offset: number,
+  profile: FuzzProfile = FUZZ_PROFILE,
+): Promise<{ results: FuzzResult[]; alerts: Alert[]; newOffset: number; done: boolean }> {
+  const all: string[] = [];
+  for (const cat of profile.categories) {
+    for (const line of WORDLISTS[cat].split("\n")) {
+      const sanitized = sanitizeWordlistEntry(line);
+      if (sanitized) all.push(sanitized.startsWith("/") ? sanitized : `/${sanitized}`);
+    }
+  }
+  // Deduplicate while keeping order.
   const seen = new Set<string>();
-  for (const raw of entries) {
-    const v = sanitizeWordlistEntry(raw);
-    if (!v) { rejected++; continue; }
-    if (seen.has(v)) continue;
-    seen.add(v);
-    accepted.push(v);
-    if (accepted.length >= LIMITS.MAX_WORDLIST_ENTRIES) break;
-  }
-  const checksum = await sha256(accepted.join("\n"));
-  const id = randomId("wl", 12);
-  await db
-    .prepare(`INSERT INTO wordlists (id, organization_id, name, version, category, source, r2_key, entry_count, content_hash, created_at, updated_at) VALUES (?, ?, ?, '1.0.0', ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, orgId, name, category, source, `wordlist/${id}.txt`, accepted.length, checksum, new Date().toISOString(), new Date().toISOString())
-    .run();
-  return { id, accepted: accepted.length, rejected, checksum };
+  const entries = all.filter((e) => (seen.has(e) ? false : (seen.add(e), true)));
+
+  const start = Math.min(offset, entries.length);
+  const slice = entries.slice(start, start + profile.maxRequests);
+
+  const results: FuzzResult[] = [];
+  const alerts: Alert[] = [];
+  let consecutiveErrors = 0;
+
+  let i = 0;
+  const workers = Array.from({ length: profile.maxConcurrency }, async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= slice.length) break;
+      if (consecutiveErrors >= 5) break;
+      const path = slice[idx]!;
+
+      const url = joinUrl(baseUrl, path);
+      if (!url) continue;
+      if (!checkUrlInScope(scope, url).allowed) continue;
+
+      try {
+        const r = await safeFetch(env, url, {
+          scope,
+          method: "GET",
+          timeoutMs: profile.timeoutMs,
+          maxBytes: profile.maxResponseBytes,
+          userAgent: env.USER_AGENT,
+          followRedirects: false,
+        });
+        if (r.status === 429 && profile.stopOn429) { consecutiveErrors = 99; break; }
+        if (r.status >= 500) { consecutiveErrors++; continue; }
+        consecutiveErrors = 0;
+
+        const text = new TextDecoder().decode(r.body);
+        const bodyHash = await sha256(text);
+        const title = (text.match(/<title[^>]*>([\s\S]{0,200}?)<\/title>/i)?.[1] ?? "").trim() || null;
+        const { classification, isSensitive } = classifyResponse(
+          r.status, r.headers["content-type"] ?? "", url, text,
+        );
+
+        results.push({
+          url,
+          status: r.status,
+          contentType: r.headers["content-type"] ?? null,
+          contentLength: r.body.byteLength,
+          title,
+          bodyHash,
+          classification,
+          isSensitive,
+        });
+
+        if (isSensitive) {
+          const fingerprint = await sha256(`fuzz|${url}|${r.status}`);
+          const inserted = await insertFinding(env.DB, {
+            targetId,
+            affectedUrl: url,
+            findingType: classification,
+            title: `Sensitive path discovered: ${path}`,
+            summary:
+              `Wordlist fuzzing found a sensitive response.\n\n` +
+              `URL: ${url}\nStatus: ${r.status}\nContent-Type: ${r.headers["content-type"] ?? "unknown"}\n` +
+              `Length: ${r.body.byteLength} bytes\nTitle: ${title ?? "—"}\nClassification: ${classification}`,
+            severity: classification === "exposed_environment" ? "critical" : "high",
+            detectionSource: "wordlist-fuzzer",
+            detectionMethod: "wordlist-fuzzing",
+            fingerprint,
+            metadata: { url, status: r.status, classification, content_length: r.body.byteLength },
+          });
+          if (inserted) {
+            alerts.push(buildAlert("new_fuzz_endpoint", targetId, {
+              asset_value: url,
+              title: `Sensitive path found: ${path} (${classification})`,
+              summary:
+                `Wordlist fuzzing found a sensitive response on ${baseUrl}.\n\n` +
+                `URL: ${url}\nStatus: ${r.status}\nClassification: ${classification}\nTitle: ${title ?? "—"}`,
+              metadata: { url, status: r.status, classification },
+            }, classification === "exposed_environment" ? "critical" : "high"));
+          }
+        }
+
+        // Throttle between requests.
+        await new Promise((resolve) => setTimeout(resolve, profile.delayMs));
+      } catch {
+        consecutiveErrors++;
+      }
+    }
+  });
+  await Promise.all(workers);
+
+  const newOffset = start + slice.length;
+  return { results, alerts, newOffset, done: newOffset >= entries.length };
 }

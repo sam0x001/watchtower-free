@@ -1,7 +1,7 @@
 {
   "name": "watchtower",
   "version": "1.0.0",
-  "description": "Watchtower — production-ready cybersecurity asset-monitoring Telegram bot for Cloudflare Workers",
+  "description": "Watchtower — bug-bounty monitoring Telegram bot on Cloudflare Workers: subdomain enumeration, asset/JS discovery, sensitive-data fuzzing, technology fingerprinting and CVE matching",
   "main": "src/index.ts",
   "type": "module",
   "private": true,
@@ -18,11 +18,7 @@
     "test:coverage": "vitest run --coverage",
     "db:migrate": "wrangler d1 migrations apply watchtower-db --local",
     "db:migrate:prod": "wrangler d1 migrations apply watchtower-db --remote",
-    "db:seed": "wrangler d1 execute watchtower-db --local --file=migrations/0001_init.sql",
     "lint": "eslint 'src/**/*.ts' 'test/**/*.ts'"
-  },
-  "dependencies": {
-    "csv-stringify": "^6.5.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240924.0",

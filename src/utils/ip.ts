@@ -52,23 +52,26 @@ export function parseIPv6(s: string): ParsedIPv6 | null {
     if (head.length !== 8) return null;
   }
 
-  // Handle IPv4-mapped tail like "::ffff:1.2.3.4"
+  // Handle IPv4-mapped tail like "::ffff:1.2.3.4" — the dotted quad becomes TWO
+  // 16-bit segments, not one colon-joined string.
   if (tail.length > 0 && tail[tail.length - 1]!.includes(".")) {
     const v4 = parseIPv4(tail[tail.length - 1]!);
     if (!v4) return null;
-    tail[tail.length - 1] = (
-      (v4.parts[0]! << 8 | v4.parts[1]!).toString(16) +
-      ":" +
-      (v4.parts[2]! << 8 | v4.parts[3]!).toString(16)
+    tail.splice(
+      tail.length - 1,
+      1,
+      (v4.parts[0]! << 8 | v4.parts[1]!).toString(16),
+      (v4.parts[2]! << 8 | v4.parts[3]!).toString(16),
     );
   }
   if (head.length > 0 && head[head.length - 1]!.includes(".")) {
     const v4 = parseIPv4(head[head.length - 1]!);
     if (!v4) return null;
-    head[head.length - 1] = (
-      (v4.parts[0]! << 8 | v4.parts[1]!).toString(16) +
-      ":" +
-      (v4.parts[2]! << 8 | v4.parts[3]!).toString(16)
+    head.splice(
+      head.length - 1,
+      1,
+      (v4.parts[0]! << 8 | v4.parts[1]!).toString(16),
+      (v4.parts[2]! << 8 | v4.parts[3]!).toString(16),
     );
   }
 
@@ -152,19 +155,24 @@ export function isIPv4MappedIPv6(ip: ParsedIPv6): boolean {
 export function isPrivateOrReserved(ip: ParsedIP): boolean {
   if (ip.family === 4) {
     const n = ip.num;
-    if ((n & 0xff000000) === 0x0a000000) return true;     // 10/8
-    if ((n & 0xffc00000) === 0x64400000) return true;    // 100.64/10 CGNAT
-    if ((n & 0xff000000) === 0x7f000000) return true;    // 127/8
-    if ((n & 0xffff0000) === 0xa9fe0000) return true;    // 169.254/16
-    if ((n & 0xfff00000) === 0xac100000) return true;    // 172.16/12
-    if ((n & 0xffffff00) === 0xc0000000) return true;    // 192.0.0/24
-    if ((n & 0xffffff00) === 0xc0000200) return true;    // 192.0.2/24
-    if ((n & 0xffff0000) === 0xc0a80000) return true;    // 192.168/16
-    if ((n & 0xfffe0000) === 0xc6120000) return true;    // 198.18/15
-    if ((n & 0xffffff00) === 0xc6336400) return true;    // 198.51.100/24
-    if ((n & 0xffffff00) === 0xcb007100) return true;    // 203.0.113/24
-    if ((n & 0xf0000000) === 0xe0000000) return true;    // 224/4 multicast
-    if ((n & 0xf0000000) === 0xf0000000) return true;    // 240/4 reserved
+    // NOTE: JS bitwise ops return SIGNED 32-bit ints, so every masked value must
+    // be coerced back to unsigned before comparing with a constant >= 0x80000000
+    // (192.168/16, 169.254/16, 172.16/12, 224/4 …). Without `>>> 0` those ranges
+    // silently fell through as "public".
+    const masked = (mask: number): number => (n & mask) >>> 0;
+    if (masked(0xff000000) === 0x0a000000) return true;  // 10/8
+    if (masked(0xffc00000) === 0x64400000) return true;  // 100.64/10 CGNAT
+    if (masked(0xff000000) === 0x7f000000) return true;  // 127/8
+    if (masked(0xffff0000) === 0xa9fe0000) return true;  // 169.254/16
+    if (masked(0xfff00000) === 0xac100000) return true;  // 172.16/12
+    if (masked(0xffffff00) === 0xc0000000) return true;  // 192.0.0/24
+    if (masked(0xffffff00) === 0xc0000200) return true;  // 192.0.2/24
+    if (masked(0xffff0000) === 0xc0a80000) return true;  // 192.168/16
+    if (masked(0xfffe0000) === 0xc6120000) return true;  // 198.18/15
+    if (masked(0xffffff00) === 0xc6336400) return true;  // 198.51.100/24
+    if (masked(0xffffff00) === 0xcb007100) return true;  // 203.0.113/24
+    if (masked(0xf0000000) === 0xe0000000) return true;  // 224/4 multicast
+    if (masked(0xf0000000) === 0xf0000000) return true;  // 240/4 reserved
     if (n === 0xffffffff) return true;                   // broadcast
     if (n === 0) return true;                            // 0.0.0.0
     return false;

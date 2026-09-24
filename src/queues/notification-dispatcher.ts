@@ -1,22 +1,20 @@
 // src/queues/notification-dispatcher.ts
-// Synchronous notification dispatcher — replaces the v2 NOTIFY_QUEUE consumer.
+// Telegram-only notification dispatcher.
 //
-// Reads pending `notification` jobs from `job_queue`, sends each via the
-// configured channel (Telegram, Slack, email, etc.), and marks them sent
-// or failed.
+// Reads pending `notification` jobs from `job_queue` (written by the scan
+// runner and the cron handler), suppresses anything that was already delivered
+// for the same dedupe_key inside LIMITS.NOTIFICATION_DEDUPE_WINDOW_HOURS, then
+// sends one message per allowlisted Telegram user and marks the job
+// sent / failed (a failure is retried with backoff by failJob).
 
 import type { Env } from "../env.js";
-import type { NotificationMessage } from "../types.js";
-import { sendMessage } from "../telegram/webhook.js";
-import { redactSync } from "../security/redaction.js";
-import { log as defaultLog } from "../audit/logger.js";
-import { sendSlack } from "../notifications/slack.js";
-import { sendJira } from "../notifications/jira.js";
-import { sendEmail } from "../notifications/email.js";
-import { sendGithub } from "../notifications/github.js";
-import { sendGenericWebhook } from "../notifications/webhook.js";
-import { claimPendingJobs, completeJob, failJob } from "../db/job-queue.js";
 import { num } from "../env.js";
+import { LIMITS } from "../constants.js";
+import type { NotificationMessage, Severity } from "../types.js";
+import { sendMessage, resolveAllowlist } from "../telegram/webhook.js";
+import { redactSync } from "../security/redaction.js";
+import { claimPendingJobs, completeJob, failJob } from "../db/job-queue.js";
+import { log } from "../lib/console-logger.js";
 
 const SEVERITY_EMOJI: Record<string, string> = {
   critical: "🚨",
@@ -26,92 +24,142 @@ const SEVERITY_EMOJI: Record<string, string> = {
   informational: "📌",
 };
 
-export async function dispatchPendingNotifications(
-  env: Env,
-  ctx: ExecutionContext,
-): Promise<{ claimed: number; sent: number; failed: number }> {
-  const log = defaultLog;
-  const maxPerCron = num(env.FREE_TIER_MAX_NOTIFICATIONS_PER_CRON, 10);
+/** How long a claimed job stays locked while we send it. */
+const NOTIFICATION_LOCK_MS = 60_000;
 
-  const jobs = await claimPendingJobs(env.DB, "notification", maxPerCron, 60_000);
-  let sent = 0;
-  let failed = 0;
-
-  for (const job of jobs) {
-    ctx.waitUntil((async () => {
-      const data = job.payload as unknown as NotificationMessage & { dedup_key?: string };
-
-      // Dedup: if we already sent a notification with this dedup_key in the
-      // last 24h, mark this one completed without sending.
-      const dedupKey = data.dedup_key ?? job.payload["dedup_key"] as string | undefined;
-      if (dedupKey) {
-        const existing = await env.DB
-          .prepare(`SELECT id FROM notifications WHERE dedupe_key = ? AND status = 'sent' AND created_at > ?`)
-          .bind(dedupKey, new Date(Date.now() - 24 * 3600 * 1000).toISOString())
-          .first<{ id: string }>();
-        if (existing) {
-          await completeJob(env.DB, job.id);
-          return;
-        }
-      }
-
-      const id = `notif_${crypto.randomUUID()}`;
-      await env.DB
-        .prepare(`INSERT INTO notifications (id, organization_id, target_id, finding_id, channel, destination, alert_type, severity, title, body_redacted, dedupe_key, status, attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'scan_alert', ?, ?, ?, ?, 'pending', ?, ?, ?)`)
-        .bind(id, data.organization_id, data.target_id ?? null, data.finding_id ?? null, data.channel, data.channel, data.severity, String(data.payload?.title ?? 'Watchtower alert'), JSON.stringify(data.payload), dedupKey ?? `adhoc-${id}`, (job.attempts ?? 1) - 1, new Date().toISOString(), new Date().toISOString())
-        .run();
-
-      const { redacted } = redactSync(JSON.stringify(data.payload, null, 2));
-      const sanitizedPayload = JSON.parse(redacted) as Record<string, unknown>;
-      let didSend = false;
-      let lastErr: string | null = null;
-
-      try {
-        switch (data.channel) {
-          case "telegram": {
-            const message = formatTelegramAlert(data.severity, sanitizedPayload);
-            const owner = await env.DB
-              .prepare(`SELECT u.telegram_user_id FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id WHERE m.organization_id = ? AND r.name = 'owner' LIMIT 1`)
-              .bind(data.organization_id)
-              .first<{ telegram_user_id: string }>();
-            if (owner?.telegram_user_id) {
-              await sendMessage(env, Number(owner.telegram_user_id), message, { parseMode: "HTML" });
-              didSend = true;
-            } else {
-              lastErr = "no owner telegram_user_id found";
-            }
-            break;
-          }
-          case "slack": didSend = await sendSlack(env, data); break;
-          case "email": didSend = await sendEmail(env, data); break;
-          case "jira": didSend = await sendJira(env, data); break;
-          case "github": didSend = await sendGithub(env, data); break;
-          case "webhook": didSend = await sendGenericWebhook(env, data); break;
-          default: lastErr = `unknown channel: ${data.channel}`;
-        }
-      } catch (err) {
-        lastErr = String(err);
-      }
-
-      await env.DB
-        .prepare(`UPDATE notifications SET status = ?, last_error = ?, attempts = ?, sent_at = ? WHERE id = ?`)
-        .bind(didSend ? "sent" : "failed", lastErr, job.attempts, didSend ? new Date().toISOString() : null, id)
-        .run();
-
-      if (didSend) {
-        await completeJob(env.DB, job.id);
-        sent++;
-      } else {
-        await failJob(env.DB, job.id, lastErr ?? "unknown", { retry_after_seconds: 30 * job.attempts });
-        failed++;
-      }
-    })());
-  }
-
-  return { claimed: jobs.length, sent, failed };
+export interface DispatchResult {
+  claimed: number;
+  sent: number;
+  failed: number;
+  deduplicated: number;
 }
 
-function formatTelegramAlert(severity: string, payload: Record<string, unknown>): string {
+export async function dispatchPendingNotifications(
+  env: Env,
+  _ctx: ExecutionContext,
+): Promise<DispatchResult> {
+  const maxPerCron = num(env.FREE_TIER_MAX_NOTIFICATIONS_PER_CRON, 10);
+  const jobs = await claimPendingJobs(env.DB, "notification", maxPerCron, NOTIFICATION_LOCK_MS);
+
+  const recipients = (await resolveAllowlist(env)).filter((id) => /^\d+$/.test(id));
+  let sent = 0;
+  let failed = 0;
+  let deduplicated = 0;
+
+  for (const job of jobs) {
+    const data = job.payload as unknown as NotificationMessage;
+    const dedupeKey = (job.payload["dedup_key"] as string | undefined) ?? `job:${job.id}`;
+    const severity: Severity = data.severity ?? "informational";
+    const payload = (data.payload ?? {}) as Record<string, unknown>;
+    const title = String(payload["title"] ?? "Watchtower alert");
+
+    // ---- Dedup -----------------------------------------------------------
+    if (await alreadySent(env.DB, dedupeKey)) {
+      await completeJob(env.DB, job.id);
+      deduplicated++;
+      continue;
+    }
+
+    // ---- Record the attempt ---------------------------------------------
+    // Only the redacted JSON is ever written down; the alert itself never
+    // contains a raw secret value in the first place.
+    const notificationId = `notif_${crypto.randomUUID()}`;
+    const bodyRedacted = redactSync(JSON.stringify(payload)).redacted.slice(0, 8000);
+    await env.DB
+      .prepare(
+        `INSERT INTO notifications (
+           id, organization_id, target_id, finding_id, channel, destination,
+           alert_type, severity, title, body_redacted, dedupe_key, status,
+           attempts, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'telegram', ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      )
+      .bind(
+        notificationId,
+        data.organization_id ?? "default",
+        data.target_id ?? null,
+        data.finding_id ?? null,
+        recipients.join(",") || "none",
+        String(payload["change_type"] ?? "alert"),
+        severity,
+        title.slice(0, 300),
+        bodyRedacted,
+        dedupeKey,
+        job.attempts,
+        new Date().toISOString(),
+        new Date().toISOString(),
+      )
+      .run();
+
+    if (recipients.length === 0) {
+      await markNotification(env.DB, notificationId, "failed", "no allowlisted Telegram recipients", job.attempts);
+      await failJob(env.DB, job.id, "no allowlisted Telegram recipients", { retry_after_seconds: 900 });
+      failed++;
+      continue;
+    }
+
+    // ---- Send ------------------------------------------------------------
+    const message = formatTelegramAlert(severity, payload);
+    let delivered = 0;
+    let lastError: string | null = null;
+
+    for (const chatId of recipients) {
+      try {
+        await sendMessage(env, Number(chatId), message, { parseMode: "HTML" });
+        delivered++;
+      } catch (err) {
+        lastError = String(err);
+        log.warn("notification.send_failed", { chatId, notificationId, err: lastError });
+      }
+    }
+
+    if (delivered > 0) {
+      await markNotification(env.DB, notificationId, "sent", lastError, job.attempts);
+      await completeJob(env.DB, job.id);
+      sent++;
+    } else {
+      await markNotification(env.DB, notificationId, "failed", lastError ?? "unknown error", job.attempts);
+      await failJob(env.DB, job.id, lastError ?? "unknown error", {
+        retry_after_seconds: 60 * Math.max(1, job.attempts),
+      });
+      failed++;
+    }
+  }
+
+  return { claimed: jobs.length, sent, failed, deduplicated };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** True when an identical alert was already delivered inside the dedupe window. */
+async function alreadySent(db: D1Database, dedupeKey: string): Promise<boolean> {
+  const cutoff = new Date(Date.now() - LIMITS.NOTIFICATION_DEDUPE_WINDOW_HOURS * 3_600_000).toISOString();
+  const row = await db
+    .prepare(`SELECT id FROM notifications WHERE dedupe_key = ? AND status = 'sent' AND created_at > ? LIMIT 1`)
+    .bind(dedupeKey, cutoff)
+    .first<{ id: string }>();
+  return !!row;
+}
+
+async function markNotification(
+  db: D1Database,
+  id: string,
+  status: "sent" | "failed",
+  error: string | null,
+  attempts: number,
+): Promise<void> {
+  await db
+    .prepare(`UPDATE notifications SET status = ?, last_error = ?, attempts = ?, sent_at = ?, updated_at = ? WHERE id = ?`)
+    .bind(status, error?.slice(0, 500) ?? null, attempts, status === "sent" ? new Date().toISOString() : null, new Date().toISOString(), id)
+    .run();
+}
+
+/**
+ * Render one alert as Telegram HTML. Kept deliberately plain: a severity
+ * header, the target, the change type and the summary body.
+ */
+export function formatTelegramAlert(severity: string, payload: Record<string, unknown>): string {
   const emoji = SEVERITY_EMOJI[severity] ?? "📌";
   const title = (payload["title"] as string) ?? (payload["change_type"] as string) ?? "Notification";
   const summary = (payload["summary"] as string) ?? "";
@@ -124,9 +172,8 @@ function formatTelegramAlert(severity: string, payload: Record<string, unknown>)
   const changeLine = changeType ? `\n<b>Change type:</b> <code>${escapeHtml(changeType)}</code>` : "";
   const findingLine = findingId ? `\n<b>Finding ID:</b> <code>${escapeHtml(findingId)}</code>` : "";
   const summaryBlock = summary ? `\n\n${escapeHtml(summary)}` : "";
-  const footer = `\n\n<i>Use /diff_latest to see all recent changes or /finding_details to inspect a specific finding.</i>`;
 
-  return `${header}${targetLine}${changeLine}${findingLine}${summaryBlock}${footer}`;
+  return `${header}${targetLine}${changeLine}${findingLine}${summaryBlock}`;
 }
 
 function escapeHtml(s: string): string {
@@ -136,3 +183,4 @@ function escapeHtml(s: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+

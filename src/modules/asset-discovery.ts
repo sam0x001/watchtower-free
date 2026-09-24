@@ -16,7 +16,7 @@ import {
 } from "../db/queries/assets.js";
 import { normalizeDomain } from "../utils/domain.js";
 import { LIMITS } from "../constants.js";
-import type { ConsoleLogger } from "../audit/logger.js";
+import type { ConsoleLogger } from "../lib/console-logger.js";
 import { buildAlert, type Alert } from "./alerts.js";
 
 export interface AssetDiscoveryResult {

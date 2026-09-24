@@ -1,8 +1,8 @@
 // src/modules/alerts.ts
 // Unified alert type used across the scan pipeline. Every discovery stage
-// (CT, DNS, HTTP probing, JS analysis, secret detection) emits a list of
-// `Alert` objects. The scan consumer converts each one into a
-// `NotificationMessage` and enqueues it to `NOTIFY_QUEUE`.
+// (CT, DNS bruteforce, HTTP probing, JS analysis, secret detection, CVE
+// matching, wordlist fuzzing) emits `Alert` objects. The scan runner converts
+// each one into a `notification` job; the dispatcher sends it to Telegram.
 //
 // Dedup keys are deterministic per (alert_type, target_id, asset_identifier)
 // so re-running the same scan doesn't spam the operator with duplicate alerts.
@@ -23,7 +23,9 @@ export type AlertType =
   | "new_javascript_file"
   | "javascript_changed"
   | "new_api_endpoint"
+  | "new_fuzz_endpoint"
   | "new_secret_candidate"
+  | "new_cve"
   | "scan_completed"
   | "scan_failed";
 
@@ -32,9 +34,9 @@ export interface Alert {
   severity: Severity;
   title: string;
   summary: string;
-  /** Stable identifier used as the NOTIFY_QUEUE dedup_key. */
+  /** Stable identifier used as the notification dedup_key. */
   dedup_key: string;
-  /** Free-form metadata that ends up in the notification payload (redacted). */
+  /** Free-form metadata that ends up in the notification payload. */
   metadata: Record<string, unknown>;
 }
 
@@ -42,12 +44,15 @@ export interface Alert {
 export function severityFor(type: AlertType): Severity {
   switch (type) {
     case "new_secret_candidate":
+      return "high";
+    case "new_cve":
     case "new_certificate":
       return "high";
     case "new_subdomain":
     case "new_ip":
     case "new_service":
     case "new_api_endpoint":
+    case "new_fuzz_endpoint":
     case "new_javascript_file":
     case "technology_version_changed":
     case "service_status_changed":
@@ -80,7 +85,7 @@ export function buildAlert(
   const sev = severity ?? severityFor(type);
   // dedup_key format: "<type>:<target_id>:<asset_value>"
   // For the same asset discovered again on a later scan, the dedup_key matches
-  // and the notification consumer suppresses the duplicate.
+  // and the dispatcher suppresses the duplicate.
   const dedup_key = `${type}:${targetId}:${fields.asset_value}`;
   return {
     type,

@@ -1,610 +1,505 @@
 // src/telegram/commands.ts
-// Command router for Telegram. Implements all 44 commands listed in the spec.
+// Command router — the entire bot surface:
+//   /start /help /target-add /target-info /add /remove /list /exclude
+//   /scan /feature /allow /disallow
+//
+// Note on names: Telegram command menus only allow [a-zA-Z0-9_], but
+// parseCommand normalizes "-" to "_", so `/target-add` and `/target_add`
+// both work when typed; the menu registers the underscore form.
 
 import type { Env } from "../env.js";
-import type { ConsoleLogger, D1AuditLogger } from "../audit/logger.js";
 import { sendMessage } from "./webhook.js";
 import { messages } from "./messages.js";
-import { EmergencyStopClient } from "../db/emergency-stop.js";
-import { enqueueJob, cancelJob } from "../db/job-queue.js";
-import { randomId, sha256 } from "../crypto/hash.js";
-import { ensureUserId, findUserIdByTelegram, resolveRoleId, targetContext } from "../db/queries/identity.js";
+import { normalizeDomain } from "../utils/domain.js";
+import type { ScopeType } from "../types.js";
+import {
+  getTargetByNameOrId,
+  listTargets,
+  listScopeEntries,
+  createTarget,
+  deleteTarget,
+  insertScopeEntry,
+  removeScopeEntry,
+  addAllowedUser,
+  removeAllowedUser,
+  createTargetGroup,
+  getTargetGroupByNameOrId,
+  listTargetGroups,
+  listTargetsByGroup,
+  setTargetGroup,
+} from "../db/queries/targets.js";
+import { FEATURES, FEATURE_KEYS, getFeatureMap, setFeature, type FeatureKey } from "../db/queries/features.js";
+import { loadTargetOverview, countEnabled } from "../db/queries/groups-view.js";
 
-interface CommandContext {
+/** Compact "3m ago" / "5h ago" style timestamp for the boards. */
+function relTime(iso: string): string {
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 0) return "just now";
+  const min = Math.floor(ms / 60_000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+import { runInitialScanInline } from "../queues/scan-runner.js";
+
+export interface CommandContext {
   text: string;
   chatId: number;
   user: { id: number; first_name?: string; username?: string } | null;
   requestId: string;
-  audit: D1AuditLogger;
-  log: ConsoleLogger;
+  /** Effective allowlist at dispatch time (env seed + allowed_users). */
+  allowlist: string[];
 }
 
-// Telegram uses `/cmd_arg_arg` (we registered commands as e.g. "scope_add").
-// However the bot also accepts `/scope add` (multi-word) — normalize both forms.
-function parseCommand(text: string): { command: string; args: string[] } {
+interface ParsedCommand {
+  command: string;
+  args: string[];
+}
+
+// Telegram sends "/cmd" or "/cmd@botname"; normalize both.
+function parseCommand(text: string): ParsedCommand {
   const trimmed = text.trim().replace(/^@\w+\s+/, "").replace(/^\//, "");
   const [first, ...rest] = trimmed.split(/\s+/);
   if (!first) return { command: "help", args: [] };
+  return { command: first.toLowerCase().replace(/-/g, "_"), args: rest };
+}
 
-  // Accept slash-synonyms like "/scope_add" or "/scope add"
-  const underscored = first.toLowerCase().replace(/-/g, "_");
-  const knownMulti = new Set([
-    "scope", "target", "scan", "findings", "finding", "report", "diff",
-    "alerts", "schedule", "integration", "team",
-  ]);
-  if (knownMulti.has(underscored) && rest.length > 0) {
-    const sub = rest[0]!.toLowerCase().replace(/-/g, "_");
-    return { command: `${underscored}_${sub}`, args: rest.slice(1) };
-  }
-  return { command: underscored, args: rest };
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 export async function handleCommand(env: Env, ctx: CommandContext): Promise<void> {
   const { command, args } = parseCommand(ctx.text);
-  const handler = handlers[command] ?? handlers["help"]!;
-  await ctx.audit.log({
-    timestamp: new Date().toISOString(),
-    user_id: null,
-    telegram_id: ctx.user ? String(ctx.user.id) : null,
-    organization_id: null,
-    action: `telegram.command.${command}`,
-    target_id: args[0] ?? null,
-    scope_id: null,
-    job_id: null,
-    scanner: null,
-    args_redacted: JSON.stringify({ args }),
-    result: "success",
-    error: null,
-    ip: null,
-    request_id: ctx.requestId,
-  });
-
+  const handler = handlers[command];
+  if (!handler) {
+    await sendMessage(env, ctx.chatId, `Unknown command /${command}. Send /help to see what I can do.`);
+    return;
+  }
   try {
     await handler(env, ctx, args);
   } catch (err) {
-    ctx.log.error(`telegram.command.${command}.failed`, { err: String(err), requestId: ctx.requestId });
-    await sendMessage(env, ctx.chatId, `❌ Command failed: ${String(err)}`);
+    await sendMessage(env, ctx.chatId, `❌ Command failed: ${String(err).slice(0, 300)}`);
   }
 }
 
 type CommandHandler = (env: Env, ctx: CommandContext, args: string[]) => Promise<void>;
 
-/**
- * Canonical alert toggling. Alerting is modelled as per-target notification
- * preferences (`notification_preferences`), not a JSON blob on the target row.
- */
-async function setTargetAlerts(env: Env, targetId: string, enabled: boolean): Promise<void> {
-  const target = await targetContext(env.DB, targetId);
-  if (!target) return;
-  const now = new Date().toISOString();
-  const existing = await env.DB
-    .prepare(`SELECT id FROM notification_preferences WHERE organization_id = ? AND target_id = ? AND channel = 'telegram' LIMIT 1`)
-    .bind(target.organization_id, targetId)
-    .first<{ id: string }>();
-  if (existing) {
-    await env.DB
-      .prepare(`UPDATE notification_preferences SET enabled = ?, updated_at = ? WHERE id = ?`)
-      .bind(enabled ? 1 : 0, now, existing.id)
-      .run();
-    return;
+/** Parse a /exclude value into a scope type: path → url, `*.x` → wildcard, else domain. */
+export function classifyExclusion(raw: string): { type: ScopeType; value: string } | null {
+  const v = raw.trim().toLowerCase();
+  if (!v) return null;
+  if (v.includes("/")) {
+    // Path exclusion, e.g. example.com/admin or https://example.com/admin
+    const withScheme = /^https?:\/\//.test(v) ? v : `https://${v}`;
+    try {
+      const u = new URL(withScheme);
+      return { type: "url", value: `${u.origin}${u.pathname.replace(/\/$/, "")}` };
+    } catch {
+      return null;
+    }
   }
-  await env.DB
-    .prepare(`INSERT INTO notification_preferences (
-        id, organization_id, target_id, user_id, channel, destination, enabled,
-        min_severity, immediate_types, quiet_hours_utc, digest_frequency, created_at, updated_at
-      ) VALUES (?, ?, ?, NULL, 'telegram', NULL, ?, 'low', '[]', NULL, 'immediate', ?, ?)`)
-    .bind(randomId("npref", 12), target.organization_id, targetId, enabled ? 1 : 0, now, now)
-    .run();
+  if (v.startsWith("*.")) {
+    const d = normalizeDomain(v);
+    return d ? { type: "wildcard_domain", value: `*.${d}` } : null;
+  }
+  const d = normalizeDomain(v);
+  return d ? { type: "domain", value: d } : null;
 }
 
 const handlers: Record<string, CommandHandler> = {
   start: async (env, ctx) => {
-    await sendMessage(env, ctx.chatId, messages.welcome(ctx.user?.first_name ?? "operator"), { parseMode: "HTML" });
+    await sendMessage(env, ctx.chatId, messages.welcome(ctx.user?.first_name ?? "operator", ctx.user?.id ?? null), { parseMode: "HTML" });
   },
+
   help: async (env, ctx) => {
     await sendMessage(env, ctx.chatId, messages.help(), { parseMode: "HTML" });
   },
-  authorize: async (env, ctx, args) => {
-    if (args.length < 2) {
-      await sendMessage(env, ctx.chatId, "Usage: /authorize <target_name> <authorization_reference>\nExample: /authorize example.com WRITTEN-CONTRACT-2026-001");
-      return;
-    }
-    const targetName = args[0]!;
-    const reference = args.slice(1).join(" ");
-    const createdBy = await ensureUserId(env.DB, ctx.user);
-    if (!createdBy) { await sendMessage(env, ctx.chatId, "⛔ Cannot resolve your user record. Send /start first."); return; }
-    // Resolve the operator's organization from their membership; fall back to the
-    // bootstrap 'ORG_main' org documented in DEPLOYMENT.md so the FK is satisfied.
-    const orgRow = await env.DB
-      .prepare(`SELECT organization_id FROM memberships WHERE user_id = ? AND status = 'active' LIMIT 1`)
-      .bind(createdBy)
-      .first<{ organization_id: string }>();
-    const orgId = orgRow?.organization_id ?? "ORG_main";
-    const targetId = randomId("TGT", 8);
-    const now = new Date().toISOString();
-    const validUntil = new Date(Date.now() + 365 * 86_400_000).toISOString();
-    try {
-      await env.DB
-        .prepare(
-          `INSERT INTO targets (
-             id, organization_id, name, program_handle, criticality, data_sensitivity,
-             internet_exposed, status, authorization_status, authorization_type,
-             authorization_ref, valid_from, valid_until, passive_only, low_impact_active,
-             intrusive_enabled, human_approval_required, max_requests_per_minute,
-             max_concurrent_jobs, scan_profile, created_by, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, 'medium', 'internal', 1, 'active', 'confirmed',
-             'bug_bounty_program', ?, ?, ?, 1, 0, 0, 1, 60, 1, 'passive-only', ?, ?, ?)`,
-        )
-        .bind(targetId, orgId, targetName, reference, reference, now, validUntil, createdBy, now, now)
-        .run();
-    } catch (err) {
-      await sendMessage(env, ctx.chatId, `❌ Target not created: ${String(err)}`);
-      return;
-    }
-    await ctx.audit.log({
-      timestamp: new Date().toISOString(),
-      user_id: null,
-      telegram_id: ctx.user ? String(ctx.user.id) : null,
-      organization_id: null,
-      action: "telegram.authorize",
-      target_id: targetId,
-      scope_id: null,
-      job_id: null,
-      scanner: null,
-      args_redacted: JSON.stringify({ target_name: targetName, reference }),
-      result: "success",
-      error: null,
-      ip: null,
-      request_id: ctx.requestId,
-    });
-    await sendMessage(env, ctx.chatId, `✅ Authorization recorded for ${targetName}.\nReference: ${reference}\nTarget ID: ${targetId}\n\nNext step — run:\n/scope_add ${targetId} domain ${targetName}`);
-  },
-  scope_add: async (env, ctx, args) => {
-    if (args.length < 2) {
-      await sendMessage(env, ctx.chatId, "Usage: /scope_add <target_id> <type:domain|wildcard_domain|ip|cidr|url|api> <value> [--exclude]\nExample: /scope_add TGT_abc domain example.com");
-      return;
-    }
-    const [targetIdOrName, type, ...rest] = args;
-    const exclude = rest.includes("--exclude");
-    const value = rest.filter((a) => a !== "--exclude").join(" ");
-    const target = await targetContext(env.DB, targetIdOrName!);
-    if (!target) { await sendMessage(env, ctx.chatId, "Target not found. Run /target_list <org_id> to see IDs, or use the target name (e.g. rapyd.com)."); return; }
-    const targetId = target.id;
-    const createdBy = await ensureUserId(env.DB, ctx.user);
-    if (!createdBy) { await sendMessage(env, ctx.chatId, "⛔ Cannot resolve your user record. Send /start first."); return; }
-    const id = randomId("scope", 12);
-    const now = new Date().toISOString();
-    try {
-      await env.DB
-        .prepare(
-          `INSERT INTO scopes (
-             id, organization_id, target_id, scope_type, value, display_value, status,
-             is_primary, is_denylist, include_subdomains, notes,
-             valid_from, valid_until, created_by, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, 1, NULL, ?, ?, ?, ?, ?)`,
-        )
-        .bind(
-          id, target.organization_id, target.id, type, value, value,
-          exclude ? 1 : 0,
-          target.valid_from, target.valid_until, createdBy, now, now,
-        )
-        .run();
-    } catch (err) {
-      await sendMessage(env, ctx.chatId, `❌ Scope not added: ${String(err)}`);
-      return;
-    }
-    await sendMessage(env, ctx.chatId, `✅ Scope entry added: ${type} ${value} (${exclude ? "denylist" : "allowlist"})\nID: ${id}`);
-  },
-  scope_list: async (env, ctx, args) => {
-    const targetId = args[0];
-    if (!targetId) { await sendMessage(env, ctx.chatId, "Usage: /scope_list <target_id>"); return; }
-    const rows = await env.DB
-      .prepare(`SELECT id, scope_type, value, is_denylist, status, valid_until FROM scopes WHERE target_id = ? AND status != 'removed' ORDER BY is_denylist ASC, created_at DESC`)
-      .bind(targetId)
-      .all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `${r["is_denylist"] ? "🚫" : "✅"} [${r["scope_type"]}] ${r["value"]}  ${r["status"] === "active" ? "" : `(${r["status"]})`}`);
-    await sendMessage(env, ctx.chatId, lines.length ? `📋 Scope for ${targetId}:\n\n${lines.join("\n")}` : "No scope entries yet.");
-  },
-  scope_update: async (env, ctx, args) => {
-    if (args.length < 2) { await sendMessage(env, ctx.chatId, "Usage: /scope_update <scope_id> <new_value>"); return; }
-    const [scopeId, value] = args;
-    await env.DB.prepare(`UPDATE scopes SET value = ?, display_value = ?, updated_at = ? WHERE id = ?`).bind(value, value, new Date().toISOString(), scopeId).run();
-    await sendMessage(env, ctx.chatId, `✅ Scope ${scopeId} updated to ${value}`);
-  },
-  scope_remove: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /scope_remove <scope_id>"); return; }
-    await env.DB.prepare(`UPDATE scopes SET status = 'removed', updated_at = ? WHERE id = ?`).bind(new Date().toISOString(), args[0]).run();
-    await sendMessage(env, ctx.chatId, `🗑 Removed scope entry ${args[0]}`);
-  },
-  scope_pause: async (env, ctx, args) => {
-    const now = new Date().toISOString();
-    const by = await ensureUserId(env.DB, ctx.user);
-    await env.DB.prepare(`UPDATE scopes SET status = 'paused', paused_at = ?, paused_by = ?, updated_at = ? WHERE id = ?`).bind(now, by, now, args[0]).run();
-    await sendMessage(env, ctx.chatId, `⏸ Paused scope ${args[0]}`);
-  },
-  scope_resume: async (env, ctx, args) => {
-    await env.DB.prepare(`UPDATE scopes SET status = 'active', paused_at = NULL, paused_by = NULL, updated_at = ? WHERE id = ?`).bind(new Date().toISOString(), args[0]).run();
-    await sendMessage(env, ctx.chatId, `▶️ Resumed scope ${args[0]}`);
-  },
-  scope_expire: async (env, ctx, args) => {
-    const now = new Date().toISOString();
-    await env.DB.prepare(`UPDATE scopes SET status = 'expired', expired_at = ?, valid_until = ?, updated_at = ? WHERE id = ?`).bind(now, now, now, args[0]).run();
-    await sendMessage(env, ctx.chatId, `⌛ Marked scope ${args[0]} as expired`);
-  },
+
   target_add: async (env, ctx, args) => {
-    if (args.length < 3) {
-      await sendMessage(env, ctx.chatId, "Usage: /target_add <org_id> <name> <authorization_expires_at:YYYY-MM-DD> [program_url]");
+    if (args.length < 1) {
+      await sendMessage(env, ctx.chatId,
+        "Usage: /target-add <category_name>\n" +
+        "Example: /target-add shop\n" +
+        "Then add domains to it: /add shop.example.com shop");
       return;
     }
-    const [orgId, name, expiresAt, programUrl] = args;
-    const createdBy = await ensureUserId(env.DB, ctx.user);
-    if (!createdBy) { await sendMessage(env, ctx.chatId, "⛔ Cannot resolve your user record. Send /start first."); return; }
-    const id = randomId("tgt", 12);
-    const now = new Date().toISOString();
-    const validUntil = /^\d{4}-\d{2}-\d{2}$/.test(expiresAt ?? "") ? `${expiresAt}T23:59:59.000Z` : (expiresAt as string);
-    try {
-      await env.DB
+    const name = args[0]!.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+      await sendMessage(env, ctx.chatId,
+        "Category names may only contain letters, digits, dot, dash or underscore (max 64 chars).");
+      return;
+    }
+    const existing = await getTargetGroupByNameOrId(env.DB, name);
+    if (existing) {
+      await sendMessage(env, ctx.chatId,
+        `⚠️ Category <b>${escapeHtml(existing.name)}</b> already exists (${escapeHtml(existing.id)}).\n` +
+        `Show it with <code>/target-info ${escapeHtml(existing.id)}</code>.`,
+        { parseMode: "HTML" });
+      return;
+    }
+    const group = await createTargetGroup(env.DB, name, ctx.user ? String(ctx.user.id) : null);
+    await sendMessage(env, ctx.chatId,
+      `📂 Category <b>${escapeHtml(group.name)}</b> created — id <code>${escapeHtml(group.id)}</code>\n\n` +
+      `Add its domains:\n` +
+      `<code>/add example.com ${escapeHtml(group.id)}</code>\n` +
+      `<code>/add api.example.com ${escapeHtml(group.id)}</code>\n\n` +
+      `Inspect it any time with <code>/target-info ${escapeHtml(group.id)}</code>`,
+      { parseMode: "HTML" });
+  },
+
+  target_info: async (env, ctx, args) => {
+    if (args.length < 1) {
+      await sendMessage(env, ctx.chatId,
+        "Usage: /target-info <category_name_or_id>\n" +
+        "Use /list to see all categories.");
+      return;
+    }
+    const group = await getTargetGroupByNameOrId(env.DB, args[0]!);
+    if (!group) {
+      await sendMessage(env, ctx.chatId,
+        `Category ${args[0]} not found. Create it with /target-add ${args[0]} or list them with /list.`);
+      return;
+    }
+
+    const domains = await listTargetsByGroup(env.DB, group.id);
+    const overview = await loadTargetOverview(env.DB, domains.map((d) => d.id));
+
+    const lines = [
+      `📂 <b>${escapeHtml(group.name)}</b> (${escapeHtml(group.id)})`,
+      `Domains: <b>${domains.length}</b>`,
+      "",
+    ];
+
+    if (domains.length === 0) {
+      lines.push(`No domains yet — add one with <code>/add example.com ${escapeHtml(group.id)}</code>`);
+    }
+
+    for (const d of domains) {
+      const last = overview.lastScan.get(d.id) ?? null;
+      const excl = overview.exclusions.get(d.id) ?? 0;
+      const map = overview.features.get(d.id)!;
+      const onCount = countEnabled(map);
+      lines.push(
+        `• <code>${escapeHtml(d.name)}</code> — ${d.paused ? "⏸ paused" : "🟢 active"}`,
+        `  id <code>${escapeHtml(d.id)}</code> · last scan: ${last ? relTime(last) : "never"}` +
+        ` · exclusions: ${excl} · features: ${onCount}/${FEATURE_KEYS.length} on`,
+        `  toggles: <code>/feature ${escapeHtml(d.name)}</code>`,
+      );
+    }
+
+    lines.push(
+      "",
+      "<i>Feature toggles are per domain — use /feature &lt;domain&gt; on any member above.</i>",
+    );
+    await sendMessage(env, ctx.chatId, lines.join("\n"), { parseMode: "HTML" });
+  },
+
+  add: async (env, ctx, args) => {
+    if (args.length < 1) {
+      await sendMessage(env, ctx.chatId,
+        "Usage: /add <domain> [category]\n" +
+        "Example: /add shop.example.com shop\n" +
+        "Create the category first with /target-add shop (or omit it for a standalone domain).");
+      return;
+    }
+    // Optional second arg = category (name or id) the domain belongs to.
+    let group: { id: string; name: string } | null = null;
+    if (args[1]) {
+      const g = await getTargetGroupByNameOrId(env.DB, args[1]);
+      if (!g) {
+        await sendMessage(env, ctx.chatId,
+          `Category ${escapeHtml(args[1])} not found. Create it first with /target-add ${escapeHtml(args[1])}, ` +
+          `or omit the category to add a standalone domain.`,
+          { parseMode: "HTML" });
+        return;
+      }
+      group = g;
+    }
+
+    const domain = normalizeDomain(args[0]!);
+    if (!domain) {
+      await sendMessage(env, ctx.chatId, `❌ ${args[0]}: not a valid domain`);
+      return;
+    }
+
+    const existing = await getTargetByNameOrId(env.DB, domain);
+    if (existing) {
+      // Re-adding into a category moves the existing domain into it.
+      if (group && existing.group_id !== group.id) {
+        await setTargetGroup(env.DB, existing.id, group.id);
+        await sendMessage(env, ctx.chatId,
+          `📂 Moved <code>${escapeHtml(domain)}</code> into category <b>${escapeHtml(group.name)}</b>.`,
+          { parseMode: "HTML" });
+        return;
+      }
+      await sendMessage(env, ctx.chatId, `⏭ ${escapeHtml(domain)}: already monitored. Try /scan ${escapeHtml(domain)}.`);
+      return;
+    }
+
+    const target = await createTarget(
+      env.DB, domain, ctx.user ? String(ctx.user.id) : null, group?.id ?? null,
+    );
+    const where = group ? ` in category <b>${escapeHtml(group.name)}</b>` : "";
+    await sendMessage(env, ctx.chatId,
+      `✅ Added <code>${escapeHtml(domain)}</code>${where} (id <code>${escapeHtml(target.id)}</code>).\n` +
+      `Every subdomain is in scope.\n` +
+      `Next: <code>/scan ${escapeHtml(domain)}</code>` +
+      (group ? ` · <code>/target-info ${escapeHtml(group.id)}</code>` : ""),
+      { parseMode: "HTML" });
+  },
+
+  remove: async (env, ctx, args) => {
+    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /remove <domain>"); return; }
+    const target = await getTargetByNameOrId(env.DB, args[0]!);
+    if (!target) { await sendMessage(env, ctx.chatId, `Target ${args[0]} not found.`); return; }
+    await deleteTarget(env.DB, target.id);
+    await sendMessage(env, ctx.chatId, `🗑 ${target.name} removed. Monitoring and all its stored findings were deleted.`);
+  },
+
+  list: async (env, ctx) => {
+    const groups = await listTargetGroups(env.DB);
+    const targets = await listTargets(env.DB);
+    if (targets.length === 0 && groups.length === 0) {
+      await sendMessage(env, ctx.chatId,
+        "No targets yet. Add one with /add example.com\n" +
+        "Or create a category first: /target-add shop\n" +
+        "Then add its domains: /add shop.example.com shop");
+      return;
+    }
+    const lines: string[] = [];
+
+    // Categories first, each with its member domains indented underneath.
+    for (const g of groups) {
+      const members = targets.filter((t) => t.group_id === g.id);
+      lines.push(
+        `📂 <b>${escapeHtml(g.name)}</b> (<code>${escapeHtml(g.id)}</code>) — ` +
+        `${members.length} domain${members.length === 1 ? "" : "s"}`,
+      );
+      for (const m of members) {
+        lines.push(
+          `  ${m.paused ? "⏸" : "🟢"} <code>${escapeHtml(m.name)}</code>` +
+          ` — <code>/feature ${escapeHtml(m.name)}</code>`,
+        );
+      }
+      lines.push(`  <i>details: /target-info ${escapeHtml(g.id)}</i>`, "");
+    }
+
+    const standalone = targets.filter((t) => !t.group_id);
+    if (standalone.length > 0) {
+      lines.push(`<b>Standalone domains</b>`);
+      for (const t of standalone) lines.push(`• ${t.paused ? "⏸" : "🟢"} <code>${escapeHtml(t.name)}</code>`);
+      lines.push("");
+    }
+
+    for (const t of targets) {
+      const counts = await env.DB
         .prepare(
-          `INSERT INTO targets (
-             id, organization_id, name, program_handle, criticality, data_sensitivity,
-             internet_exposed, status, authorization_status, authorization_type,
-             authorization_ref, valid_from, valid_until, passive_only, low_impact_active,
-             intrusive_enabled, human_approval_required, max_requests_per_minute,
-             max_concurrent_jobs, scan_profile, created_by, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, 'medium', 'internal', 1, 'active', 'confirmed',
-             'bug_bounty_program', ?, ?, ?, 1, 0, 0, 1, 60, 3, 'passive-only', ?, ?, ?)`,
+          `SELECT
+             (SELECT COUNT(*) FROM assets WHERE target_id = ?1 AND asset_type = 'subdomain' AND scope_state = 'allowed') AS subs,
+             (SELECT COUNT(*) FROM services WHERE target_id = ?1) AS live,
+             (SELECT COUNT(*) FROM findings WHERE target_id = ?1 AND status = 'open') AS findings,
+             (SELECT MAX(created_at) FROM scans WHERE target_id = ?1 AND status = 'completed') AS last_scan`,
         )
-        .bind(id, orgId, name, programUrl ?? null, `telegram:${ctx.user?.id ?? "unknown"}`, now, validUntil, createdBy, now, now)
-        .run();
-    } catch (err) {
-      await sendMessage(env, ctx.chatId, `❌ Target not created: ${String(err)}`);
+        .bind(t.id)
+        .first<{ subs: number; live: number; findings: number; last_scan: string | null }>();
+      const status = t.paused ? "⏸" : "🟢";
+      lines.push(
+        `${status} <b>${t.name}</b>\n` +
+        `    Subdomains: ${counts?.subs ?? 0} · Live hosts: ${counts?.live ?? 0} · Open findings: ${counts?.findings ?? 0}\n` +
+        `    Last scan: ${counts?.last_scan ? counts.last_scan.replace("T", " ").slice(0, 16) + "Z" : "never"}`,
+      );
+      const exclusions = (await listScopeEntries(env.DB, t.id)).filter((e) => !e.included);
+      if (exclusions.length > 0) {
+        lines.push(`    🚫 Excluded: ${exclusions.map((e) => e.value).join(", ")}`);
+      }
+    }
+    await sendMessage(env, ctx.chatId, `📋 <b>Targets</b>\n\n${lines.join("\n\n")}`, { parseMode: "HTML" });
+  },
+
+  exclude: async (env, ctx, args) => {
+    // /exclude list <domain>
+    if (args[0]?.toLowerCase() === "list") {
+      const target = await getTargetByNameOrId(env.DB, args[1] ?? "");
+      if (!target) { await sendMessage(env, ctx.chatId, "Usage: /exclude list <domain>"); return; }
+      const exclusions = (await listScopeEntries(env.DB, target.id)).filter((e) => !e.included);
+      await sendMessage(env, ctx.chatId, exclusions.length
+        ? `🚫 Exclusions for ${target.name}:\n${exclusions.map((e) => `• [${e.type}] ${e.value}`).join("\n")}`
+        : `No exclusions for ${target.name}.`);
       return;
     }
-    await sendMessage(env, ctx.chatId, `✅ Target created.\nID: ${id}\nName: ${name}\nExpires: ${validUntil}`);
-  },
-  target_list: async (env, ctx, args) => {
-    const orgId = args[0];
-    if (!orgId) { await sendMessage(env, ctx.chatId, "Usage: /target_list <org_id>"); return; }
-    const rows = await env.DB.prepare(`SELECT id, name, status, valid_until FROM targets WHERE organization_id = ?`).bind(orgId).all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `${r["status"] === "active" ? "🟢" : "⏸"} ${r["id"]} — ${r["name"]} (${r["status"]}, expires ${r["valid_until"]})`);
-    await sendMessage(env, ctx.chatId, lines.length ? `📋 Targets:\n\n${lines.join("\n")}` : "No targets yet.");
-  },
-  target_details: async (env, ctx, args) => {
-    const r = await env.DB.prepare(`SELECT * FROM targets WHERE id = ?`).bind(args[0]).first<Record<string, unknown>>();
-    if (!r) { await sendMessage(env, ctx.chatId, "Target not found"); return; }
-    await sendMessage(env, ctx.chatId, `🎯 ${r["name"]}\nID: ${r["id"]}\nOrg: ${r["organization_id"]}\nStatus: ${r["status"]}\nPassive only: ${r["passive_only"]}\nLow-impact active: ${r["low_impact_active"]}\nMax r/min: ${r["max_requests_per_minute"]}\nMax concurrent: ${r["max_concurrent_jobs"]}\nAuthorization: ${r["authorization_status"]} (${r["valid_from"]} → ${r["valid_until"]})\nPaused at: ${r["paused_at"] ?? "n/a"}`);
-  },
-  target_pause: async (env, ctx, args) => {
-    const now = new Date().toISOString();
-    const by = await ensureUserId(env.DB, ctx.user);
-    await env.DB.prepare(`UPDATE targets SET status = 'paused', paused_at = ?, paused_by = ?, updated_at = ? WHERE id = ?`).bind(now, by, now, args[0]).run();
-    await sendMessage(env, ctx.chatId, "⏸ Target paused");
-  },
-  target_resume: async (env, ctx, args) => {
-    const now = new Date().toISOString();
-    await env.DB.prepare(`UPDATE targets SET status = 'active', paused_at = NULL, paused_by = NULL, updated_at = ? WHERE id = ?`).bind(now, args[0]).run();
-    await sendMessage(env, ctx.chatId, "▶️ Target resumed");
-  },
-  scan_passive: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /scan_passive <target_id>"); return; }
-    const targetId = args[0]!;
-    // Check emergency stop first
-    const es = new EmergencyStopClient(env.DB);
-    if (await es.isBlocked("target", targetId)) { await sendMessage(env, ctx.chatId, "⛔ Emergency stop is active for this target. Use /resume after resolving."); return; }
-    const target = await targetContext(env.DB, targetId);
-    if (!target) { await sendMessage(env, ctx.chatId, "Target not found"); return; }
-    const requestedBy = await ensureUserId(env.DB, ctx.user);
-    const jobId = randomId("scan", 12);
-    const now = new Date().toISOString();
-    // Canonical scans row: scope_snapshot/scope_hash are NOT NULL, and the row
-    // records how the scan was triggered + which mode it may run in.
-    const snapshotRows = await env.DB
-      .prepare(`SELECT id, scope_type, value, is_denylist, include_subdomains FROM scopes WHERE target_id = ? AND status = 'active' ORDER BY id ASC`)
-      .bind(targetId)
-      .all<Record<string, unknown>>();
-    const scopeSnapshot = JSON.stringify(snapshotRows.results ?? []);
-    const scopeHash = await sha256(scopeSnapshot);
-    await env.DB
-      .prepare(`INSERT INTO scans (
-          id, organization_id, target_id, scope_snapshot, scope_hash, profile, mode,
-          trigger, status, requested_by, correlation_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'passive-only', 'passive', 'manual', 'queued', ?, ?, ?, ?)`)
-      .bind(jobId, target.organization_id, targetId, scopeSnapshot, scopeHash, requestedBy, ctx.requestId, now, now)
-      .run();
-    await enqueueJob(env.DB, "scan", {
-      job_id: jobId, target_id: targetId,
-      organization_id: target.organization_id,
-      profile: "passive-only", triggered_by: "telegram", triggered_by_user_id: requestedBy,
-      attempt: 0, enqueued_at: now,
-    }, { dedup_key: `scan:${targetId}:${now.slice(0, 16)}` });
-    await sendMessage(env, ctx.chatId, `🟢 Passive scan queued.\nScan ID: ${jobId}\nRuns within ~5 minutes (next cron tick). Use /scan_status ${jobId} to track.`);
-  },
-  scan_active: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /scan_active <target_id> [confirm]\n⚠️ Requires explicit human approval. Add 'confirm' as second arg to proceed."); return; }
-    if (args[1] !== "confirm") { await sendMessage(env, ctx.chatId, "⚠️ Active scans require human approval.\nRe-run with: /scan_active <target_id> confirm"); return; }
-    const targetId = args[0]!;
-    await env.DB.prepare(`UPDATE targets SET low_impact_active = 1, updated_at = ? WHERE id = ?`).bind(new Date().toISOString(), targetId).run();
-    await sendMessage(env, ctx.chatId, "⚠️ Low-impact active scans enabled. Passive baseline will run first; intrusive checks remain blocked unless separately approved.");
-  },
-  scan_status: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /scan_status <scan_id>"); return; }
-    const r = await env.DB.prepare(`SELECT * FROM scans WHERE id = ?`).bind(args[0]).first<Record<string, unknown>>();
-    if (!r) { await sendMessage(env, ctx.chatId, "Scan not found"); return; }
-    await sendMessage(env, ctx.chatId, `Scan ${r["id"]}\nStatus: ${r["status"]}\nMode: ${r["mode"]}\nProfile: ${r["profile"]}\nTrigger: ${r["trigger"]}\nCreated: ${r["created_at"]}\nStarted: ${r["started_at"] ?? "n/a"}\nFinished: ${r["finished_at"] ?? "n/a"}\nAssets seen: ${r["assets_seen"]}\nErrors: ${r["errors_json"]}`);
-  },
-  scan_cancel: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /scan_cancel <scan_id>"); return; }
-    const jobId = args[0]!;
-    const es = new EmergencyStopClient(env.DB);
-    await es.cancelJob(jobId, ctx.user ? String(ctx.user.id) : null, "telegram.cancel");
-    await cancelJob(env.DB, jobId, "telegram.cancel");
-    const now = new Date().toISOString();
-    await env.DB
-      .prepare(`UPDATE scans SET status = 'cancelled', finished_at = ?, stop_reason = 'telegram.cancel', updated_at = ? WHERE id = ?`)
-      .bind(now, now, jobId)
-      .run();
-    await sendMessage(env, ctx.chatId, `🛑 Scan ${jobId} cancelled.`);
-  },
-  scan_history: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /scan_history <target_id>"); return; }
-    const rows = await env.DB.prepare(`SELECT id, profile, status, created_at FROM scans WHERE target_id = ? ORDER BY created_at DESC LIMIT 20`).bind(args[0]).all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `${r["status"]} ${r["id"]} (${r["profile"]}) @ ${r["created_at"]}`);
-    await sendMessage(env, ctx.chatId, lines.length ? `📋 Scan history:\n\n${lines.join("\n")}` : "No scans yet.");
-  },
-  findings_list: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /findings_list <org_id> [status] [severity]"); return; }
-    const orgId = args[0]!;
-    const status = args[1];
-    const severity = args[2];
-    const where: string[] = ["organization_id = ?"];
-    const binds: (string | number)[] = [orgId];
-    if (status) { where.push("status = ?"); binds.push(status); }
-    if (severity) { where.push("severity = ?"); binds.push(severity); }
-    const rows = await env.DB.prepare(`SELECT id, severity, title, status FROM findings WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT 20`).bind(...binds).all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `[${(r["severity"] as string).toUpperCase()}] ${r["id"]} — ${r["title"]} (${r["status"]})`);
-    await sendMessage(env, ctx.chatId, lines.length ? `📋 Findings:\n\n${lines.join("\n")}` : "No findings yet.");
-  },
-  finding_details: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /finding_details <finding_id>"); return; }
-    const r = await env.DB.prepare(`SELECT * FROM findings WHERE id = ?`).bind(args[0]).first<Record<string, unknown>>();
-    if (!r) { await sendMessage(env, ctx.chatId, "Finding not found"); return; }
-    await sendMessage(env, ctx.chatId, `[${(r["severity"] as string).toUpperCase()}] ${r["title"]}\n\n${r["summary"]}\n\nSeverity: ${r["severity"]}\nStatus: ${r["status"]}\nConfidence: ${r["confidence"]}\nDetection: ${r["detection_source"]}\nAffected: ${r["affected_url"] ?? "n/a"}`);
-  },
-  finding_verify: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /finding_verify <finding_id>"); return; }
-    // Canonical status values: triaged/in_progress/resolved/closed/... ('in_review' is not valid).
-    await env.DB.prepare(`UPDATE findings SET verification_state = 'verified', status = 'triaged', updated_at = ? WHERE id = ?`).bind(new Date().toISOString(), args[0]).run();
-    await sendMessage(env, ctx.chatId, `✅ Finding ${args[0]} marked as verified.`);
-  },
-  finding_reject: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /finding_reject <finding_id>"); return; }
-    await env.DB.prepare(`UPDATE findings SET verification_state = 'false_positive', status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?`).bind(new Date().toISOString(), new Date().toISOString(), args[0]).run();
-    await sendMessage(env, ctx.chatId, `🚫 Finding ${args[0]} rejected as false positive.`);
-  },
-  finding_assign: async (env, ctx, args) => {
-    if (args.length < 2) { await sendMessage(env, ctx.chatId, "Usage: /finding_assign <finding_id> <user_id|telegram_id>"); return; }
-    // assigned_user_id is a foreign key into users(id); accept either form.
-    const assignee = (await findUserIdByTelegram(env.DB, args[1]!))
-      ?? (await env.DB.prepare(`SELECT id FROM users WHERE id = ?`).bind(args[1]).first<{ id: string }>())?.id
-      ?? null;
-    if (!assignee) { await sendMessage(env, ctx.chatId, `User ${args[1]} not found (expected a users.id or telegram id).`); return; }
-    await env.DB.prepare(`UPDATE findings SET assigned_user_id = ?, status = 'triaged', updated_at = ? WHERE id = ?`).bind(assignee, new Date().toISOString(), args[0]).run();
-    await sendMessage(env, ctx.chatId, `📌 Finding ${args[0]} assigned to ${args[1]}.`);
-  },
-  finding_close: async (env, ctx, args) => {
-    const now = new Date().toISOString();
-    await env.DB.prepare(`UPDATE findings SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?`).bind(now, now, args[0]).run();
-    await sendMessage(env, ctx.chatId, `✅ Finding ${args[0]} closed.`);
-  },
-  finding_reopen: async (env, ctx, args) => {
-    await env.DB.prepare(`UPDATE findings SET status = 'open', verification_state = 'detected', resolved_at = NULL, closed_at = NULL, updated_at = ? WHERE id = ?`).bind(new Date().toISOString(), args[0]).run();
-    await sendMessage(env, ctx.chatId, `↩️ Finding ${args[0]} reopened.`);
-  },
-  report_create: async (env, ctx, args) => {
-    if (args.length < 2) { await sendMessage(env, ctx.chatId, "Usage: /report_create <target_id> <format:markdown|json|pdf|hackerone|bugcrowd|internal|executive>"); return; }
-    const [targetId, formatArg] = args as [string, string];
-    const target = await targetContext(env.DB, targetId);
-    if (!target) { await sendMessage(env, ctx.chatId, "Target not found"); return; }
-    const generatedBy = await ensureUserId(env.DB, ctx.user);
-    // Canonical reports separate report_type (who it is for) from format
-    // (markdown|json|pdf), so map the friendly aliases onto both.
-    const mapping: Record<string, { kind: string; format: string }> = {
-      markdown: { kind: "internal_pentest", format: "markdown" },
-      json: { kind: "internal_pentest", format: "json" },
-      pdf: { kind: "internal_pentest", format: "pdf" },
-      internal: { kind: "internal_pentest", format: "markdown" },
-      hackerone: { kind: "hackerone", format: "markdown" },
-      bugcrowd: { kind: "bugcrowd", format: "markdown" },
-      executive: { kind: "executive_summary", format: "markdown" },
-      asset_inventory: { kind: "asset_inventory", format: "json" },
-    };
-    const chosen = mapping[formatArg.toLowerCase()] ?? { kind: "internal_pentest", format: "markdown" };
-    const id = randomId("rep", 12);
-    const now = new Date().toISOString();
-    await env.DB
-      .prepare(`INSERT INTO reports (
-          id, report_ref, organization_id, target_id, report_type, format, title,
-          status, generated_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`)
-      .bind(
-        id, `RPT-${id}`, target.organization_id, targetId, chosen.kind, chosen.format,
-        `Watchtower ${chosen.kind.replace(/_/g, " ")} for ${targetId}`, generatedBy, now, now,
-      )
-      .run();
-    await enqueueJob(env.DB, "notification", {
-      organization_id: target.organization_id, target_id: targetId, channel: "telegram", severity: "informational", payload: { report_id: id, format: chosen.format }, dedup_key: `report:${id}`, attempt: 0,
-    }, { dedup_key: `report:${id}` });
-    await sendMessage(env, ctx.chatId, `📄 Report ${id} queued for generation (${chosen.format}).`);
-  },
-  report_export: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /report_export <report_id|report_ref>"); return; }
-    const r = await env.DB
-      .prepare(`SELECT id, report_ref, report_type, format, status, created_at, finding_ids, r2_key FROM reports WHERE id = ? OR report_ref = ? LIMIT 1`)
-      .bind(args[0], args[0])
-      .first<Record<string, unknown>>();
-    if (!r) { await sendMessage(env, ctx.chatId, "Report not found"); return; }
-    let findingCount = 0;
-    try { findingCount = (JSON.parse(String(r["finding_ids"] ?? "[]")) as unknown[]).length; } catch { findingCount = 0; }
-    await sendMessage(env, ctx.chatId, `📄 Report ${r["report_ref"]}\nType: ${r["report_type"]}\nFormat: ${r["format"]}\nStatus: ${r["status"]}\nCreated: ${r["created_at"]}\nFindings: ${findingCount}\nR2 key: ${r["r2_key"] ?? "pending"}`);
-  },
-  diff_latest: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /diff_latest <target_id>"); return; }
-    const rows = await env.DB.prepare(`SELECT id, change_type, severity, created_at FROM changes WHERE target_id = ? ORDER BY created_at DESC LIMIT 20`).bind(args[0]).all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `[${(r["severity"] as string).toUpperCase()}] ${r["change_type"]} (${r["id"]}) @ ${r["created_at"]}`);
-    await sendMessage(env, ctx.chatId, lines.length ? `📋 Latest changes:\n\n${lines.join("\n")}` : "No changes detected yet.");
-  },
-  diff_compare: async (env, ctx, args) => {
-    if (args.length < 2) { await sendMessage(env, ctx.chatId, "Usage: /diff_compare <target_id> <older_scan_id> <newer_scan_id>"); return; }
-    await sendMessage(env, ctx.chatId, `🔍 Diff requested (target=${args[0]}, older=${args[1]}, newer=${args[2] ?? "latest"}). Use the API to retrieve the full diff.`);
-  },
-  alerts_enable: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /alerts_enable <target_id>"); return; }
-    await setTargetAlerts(env, args[0]!, true);
-    await sendMessage(env, ctx.chatId, "🔔 Alerts enabled.");
-  },
-  alerts_disable: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /alerts_disable <target_id>"); return; }
-    await setTargetAlerts(env, args[0]!, false);
-    await sendMessage(env, ctx.chatId, "🔕 Alerts disabled.");
-  },
-  schedule_add: async (env, ctx, args) => {
-    if (args.length < 3) { await sendMessage(env, ctx.chatId, "Usage: /schedule_add <target_id> <cron_expr> <profile>"); return; }
-    const [targetIdOrName, cronExpr, profile] = args as [string, string, string];
-    const target = await targetContext(env.DB, targetIdOrName);
-    if (!target) { await sendMessage(env, ctx.chatId, "Target not found. Run /target_list <org_id> to see IDs, or use the target name."); return; }
-    const targetId = target.id;
-    const createdBy = await ensureUserId(env.DB, ctx.user);
-    if (!createdBy) { await sendMessage(env, ctx.chatId, "⛔ Cannot resolve your user record. Send /start first."); return; }
-    const id = randomId("sch", 12);
-    const now = new Date().toISOString();
-    await env.DB
-      .prepare(`INSERT INTO schedules (
-          id, organization_id, target_id, name, profile, mode, frequency, cron_expression,
-          jitter_seconds, timezone, enabled, requires_approval, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'passive', 'custom', ?, 5, 'UTC', 1, 0, ?, ?, ?)`)
-      .bind(id, target.organization_id, targetId, `Schedule ${id}`, profile, cronExpr, createdBy, now, now)
-      .run();
-    await sendMessage(env, ctx.chatId, `📅 Schedule added.\nID: ${id}\nCron: ${cronExpr}\nProfile: ${profile}`);
-  },
-  schedule_list: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /schedule_list <target_id>"); return; }
-    const rows = await env.DB.prepare(`SELECT id, cron_expression, profile, enabled, last_run_at, next_run_at FROM schedules WHERE target_id = ?`).bind(args[0]).all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `${r["enabled"] ? "🟢" : "⏸"} ${r["id"]} — ${r["cron_expression"] ?? "n/a"} (${r["profile"]}) next=${r["next_run_at"] ?? "n/a"}`);
-    await sendMessage(env, ctx.chatId, lines.length ? `📋 Schedules:\n\n${lines.join("\n")}` : "No schedules.");
-  },
-  schedule_remove: async (env, ctx, args) => {
-    await env.DB.prepare(`DELETE FROM schedules WHERE id = ?`).bind(args[0]).run();
-    await sendMessage(env, ctx.chatId, `🗑 Removed schedule ${args[0]}`);
-  },
-  integration_add: async (env, ctx, args) => {
-    if (args.length < 2) { await sendMessage(env, ctx.chatId, "Usage: /integration_add <org_id> <type:slack|jira|github|email|webhook> [config_json]"); return; }
-    const [orgId, type, ...rest] = args;
-    const config = rest.join(" ") || "{}";
-    const createdBy = await ensureUserId(env.DB, ctx.user);
-    if (!createdBy) { await sendMessage(env, ctx.chatId, "⛔ Cannot resolve your user record. Send /start first."); return; }
-    // Canonical column is `kind`, with a constrained vocabulary.
-    const kindMap: Record<string, string> = {
-      slack: "slack", jira: "jira", github: "github", email: "email",
-      webhook: "generic_webhook", generic_webhook: "generic_webhook",
-      pagerduty: "pagerduty", teams: "teams", splunk: "splunk",
-    };
-    const kind = kindMap[(type ?? "").toLowerCase()] ?? "generic_webhook";
-    const id = randomId("int", 12);
-    const now = new Date().toISOString();
-    try {
-      await env.DB
-        .prepare(`INSERT INTO integrations (id, organization_id, kind, name, config_json, enabled, created_by, created_at, updated_at)
-                  VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`)
-        .bind(id, orgId, kind, `${kind} integration`, config, createdBy, now, now)
-        .run();
-    } catch (err) {
-      await sendMessage(env, ctx.chatId, `❌ Integration not added: ${String(err)}`);
+
+    // /exclude remove <domain> <value>
+    if (args[0]?.toLowerCase() === "remove") {
+      const target = await getTargetByNameOrId(env.DB, args[1] ?? "");
+      if (!target || !args[2]) { await sendMessage(env, ctx.chatId, "Usage: /exclude remove <domain> <value>"); return; }
+      const removed = await removeScopeEntry(env.DB, target.id, args[2]!.toLowerCase());
+      await sendMessage(env, ctx.chatId, removed
+        ? `✅ ${args[2]} is no longer excluded from ${target.name}.`
+        : `No active exclusion "${args[2]}" on ${target.name}.`);
       return;
     }
-    await sendMessage(env, ctx.chatId, `🔌 Integration added (${kind}). ID: ${id}`);
-  },
-  integration_remove: async (env, ctx, args) => {
-    await env.DB.prepare(`DELETE FROM integrations WHERE id = ?`).bind(args[0]).run();
-    await sendMessage(env, ctx.chatId, `🗑 Removed integration ${args[0]}`);
-  },
-  settings: async (env, ctx) => {
-    await sendMessage(env, ctx.chatId, `⚙️ Watchtower Settings\n\nENV: ${env.WATCHTOWER_ENV}\nMax response bytes: ${env.MAX_RESPONSE_BYTES}\nMax jobs per target: ${env.MAX_JOBS_PER_TARGET}\nGlobal rate/min: ${env.GLOBAL_RATE_LIMIT_PER_MINUTE}\nEvidence retention: ${env.EVIDENCE_RETENTION_DAYS} days\nAudit retention: ${env.AUDIT_RETENTION_DAYS} days\nPassive-only default: ${env.PASSIVE_ONLY_DEFAULT}\nIntrusive testing: ${env.INTRUSIVE_TESTING_ENABLED}\nWordlist module: ${env.WORDLIST_MODULE_ENABLED}\nScope expiry warning: ${env.SCOPE_EXPIRY_WARNING_DAYS} days`);
-  },
-  team_invite: async (env, ctx, args) => {
-    if (args.length < 2) { await sendMessage(env, ctx.chatId, "Usage: /team_invite <org_id> <telegram_id> [role:viewer|analyst|admin]"); return; }
-    const [orgId, telegramId, role] = args as [string, string, string | undefined];
-    const roleId = await resolveRoleId(env.DB, role ?? "viewer");
-    if (!roleId) { await sendMessage(env, ctx.chatId, "⛔ roles table is not seeded (see migrations/0008_seed.sql)."); return; }
-    const now = new Date().toISOString();
-    // Identity first (users), then authorization (memberships).
-    let userId = await findUserIdByTelegram(env.DB, telegramId);
-    if (!userId) {
-      userId = randomId("user", 12);
-      await env.DB
-        .prepare(`INSERT INTO users (id, telegram_user_id, display_name, is_active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)`)
-        .bind(userId, telegramId, `User ${telegramId}`, now, now)
-        .run();
-    }
-    const invitedBy = await ensureUserId(env.DB, ctx.user);
-    try {
-      await env.DB
-        .prepare(`INSERT INTO memberships (id, organization_id, user_id, role_id, status, invited_by, invited_at, created_at, updated_at)
-                  VALUES (?, ?, ?, ?, 'invited', ?, ?, ?, ?)`)
-        .bind(randomId("mem", 12), orgId, userId, roleId, invitedBy, now, now, now)
-        .run();
-    } catch (err) {
-      await sendMessage(env, ctx.chatId, `❌ Invite failed: ${String(err)}`);
+
+    // /exclude <domain> <value...>
+    if (args.length < 2) {
+      await sendMessage(env, ctx.chatId,
+        "Usage: /exclude <domain> <value>\n" +
+        "Examples:\n" +
+        "/exclude example.com sub.example.com\n" +
+        "/exclude example.com *.dev.example.com\n" +
+        "/exclude example.com example.com/excluded\n\n" +
+        "/exclude list <domain> · /exclude remove <domain> <value>");
       return;
     }
-    await sendMessage(env, ctx.chatId, `👥 Invited user ${telegramId} as ${role ?? "viewer"}.`);
-  },
-  team_members: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /team_members <org_id>"); return; }
-    const rows = await env.DB
-      .prepare(`SELECT u.id, u.telegram_user_id, u.display_name, r.name AS role, m.status
-                  FROM memberships m
-                  JOIN users u ON u.id = m.user_id
-                  JOIN roles r ON r.id = m.role_id
-                 WHERE m.organization_id = ?`)
-      .bind(args[0])
-      .all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `${r["role"]} — ${r["display_name"]} (${r["telegram_user_id"] ?? r["id"]})${r["status"] === "active" ? "" : ` [${r["status"]}]`}`);
-    await sendMessage(env, ctx.chatId, lines.length ? `👥 Team:\n\n${lines.join("\n")}` : "No team members yet.");
-  },
-  audit: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /audit <org_id> [action]"); return; }
-    const orgId = args[0]!;
-    const action = args[1];
-    const where: string[] = ["organization_id = ?"];
-    const binds: (string | number)[] = [orgId];
-    if (action) { where.push("command = ?"); binds.push(action); }
-    const rows = await env.DB.prepare(`SELECT created_at, command, actor_identity, result, result_detail FROM audit_logs WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT 20`).bind(...binds).all<Record<string, unknown>>();
-    const lines = (rows.results ?? []).map((r) => `${r["created_at"]} ${r["command"]} ${r["actor_identity"] ?? ""} → ${r["result"]}${r["result_detail"] ? " (" + r["result_detail"] + ")" : ""}`);
-    await sendMessage(env, ctx.chatId, lines.length ? `📋 Audit:\n\n${lines.join("\n")}` : "No audit records.");
-  },
-  stop: async (env, ctx, args) => {
-    const es = new EmergencyStopClient(env.DB);
-    const scope = (args[0] as "global" | "organization" | "target" | "job") ?? "global";
-    const id = args[1];
-    const reason = args.slice(2).join(" ") || "manual activation via /stop";
-    await es.activate(scope, { id, user_id: ctx.user ? String(ctx.user.id) : null, reason, ttl_seconds: 24 * 3600 });
-    // Cancel all in-flight scans for the affected scope
-    const stoppedAt = new Date().toISOString();
-    const cancelSql = `UPDATE scans SET status = 'cancelled', finished_at = ?, stop_reason = 'emergency_stop', updated_at = ? WHERE status IN ('queued','validating','running')`;
-    if (scope === "global") {
-      await env.DB.prepare(cancelSql).bind(stoppedAt, stoppedAt).run();
-    } else if (scope === "organization" && id) {
-      await env.DB.prepare(`${cancelSql} AND organization_id = ?`).bind(stoppedAt, stoppedAt, id).run();
-    } else if (scope === "target" && id) {
-      await env.DB.prepare(`${cancelSql} AND target_id = ?`).bind(stoppedAt, stoppedAt, id).run();
+    const target = await getTargetByNameOrId(env.DB, args[0]!);
+    if (!target) { await sendMessage(env, ctx.chatId, `Target ${args[0]} not found. Add it first with /add.`); return; }
+
+    const lines: string[] = [];
+    for (const raw of args.slice(1)) {
+      const parsed = classifyExclusion(raw);
+      if (!parsed) { lines.push(`❌ ${raw}: could not parse`); continue; }
+      if (parsed.value === target.name && parsed.type === "domain") {
+        lines.push(`❌ ${raw}: that's the target itself`);
+        continue;
+      }
+      try {
+        await insertScopeEntry(env.DB, target.id, parsed.type, parsed.value, true, ctx.user ? String(ctx.user.id) : null);
+        lines.push(`🚫 Excluded ${parsed.value}`);
+      } catch {
+        lines.push(`⏭ ${parsed.value}: already excluded`);
+      }
     }
-    await sendMessage(env, ctx.chatId, `🛑 EMERGENCY STOP activated (${scope}${id ? ":" + id : ""}).\nAll in-flight scans for this scope have been cancelled.\nUse /resume ${scope} ${id ?? ""} to lift.`);
+    lines.push(`Exclusions apply immediately — scanning of these assets stops.`);
+    await sendMessage(env, ctx.chatId, lines.join("\n"));
   },
-  resume: async (env, ctx, args) => {
-    const es = new EmergencyStopClient(env.DB);
-    const scope = (args[0] as "global" | "organization" | "target" | "job") ?? "global";
-    const id = args[1];
-    await es.deactivate(scope, id);
-    await sendMessage(env, ctx.chatId, `✅ Resumed operations (${scope}${id ? ":" + id : ""}).`);
+
+  scan: async (env, ctx, args) => {
+    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /scan <domain>"); return; }
+    const target = await getTargetByNameOrId(env.DB, args[0]!);
+    if (!target) {
+      const group = await getTargetGroupByNameOrId(env.DB, args[0]!);
+      if (group) {
+        const members = await listTargetsByGroup(env.DB, group.id);
+        const memberLines = members.map((m) => `• <code>/scan ${escapeHtml(m.name)}</code>`);
+        await sendMessage(env, ctx.chatId,
+          `📂 <b>${escapeHtml(group.name)}</b> is a category — scans run per domain:\n` +
+          (memberLines.length > 0 ? memberLines.join("\n") : "(no domains yet)"),
+          { parseMode: "HTML" });
+        return;
+      }
+      await sendMessage(env, ctx.chatId, `Target ${args[0]} not found. Add it first with /add ${args[0]}.`);
+      return;
+    }
+    if (target.paused) { await sendMessage(env, ctx.chatId, `⏸ ${target.name} is paused.`); return; }
+    await runInitialScanInline(env, target.id, ctx.chatId);
+  },
+
+  feature: async (env, ctx, args) => {
+    if (args.length < 1) {
+      await sendMessage(env, ctx.chatId,
+        "Usage:\n" +
+        "/feature <domain> — list this domain's monitoring features\n" +
+        "/feature <domain> <key> <on|off> — toggle one (features are per domain)\n" +
+        "Example: /feature example.com port_watch off");
+      return;
+    }
+    const target = await getTargetByNameOrId(env.DB, args[0]!);
+    if (!target) {
+      const group = await getTargetGroupByNameOrId(env.DB, args[0]!);
+      if (group) {
+        // Features are per DOMAIN — point at the members instead of guessing.
+        const members = await listTargetsByGroup(env.DB, group.id);
+        const memberLines = members.map((m) => `• <code>/feature ${escapeHtml(m.name)}</code>`);
+        await sendMessage(env, ctx.chatId,
+          `⚙️ Features are configured per domain, not per category. Members of ` +
+          `<b>${escapeHtml(group.name)}</b>:\n` +
+          (memberLines.length > 0 ? memberLines.join("\n") : "(no domains in this category yet)"),
+          { parseMode: "HTML" });
+        return;
+      }
+      await sendMessage(env, ctx.chatId, `Target ${args[0]} not found. Add it first with /add ${args[0]}.`);
+      return;
+    }
+
+    const actor = ctx.user ? String(ctx.user.id) : null;
+
+    // /feature <target> → status board.
+    if (args.length === 1) {
+      const map = await getFeatureMap(env.DB, target.id);
+      const lines = [`⚙️ <b>Monitoring features for ${escapeHtml(target.name)} (${target.id})</b>`, ""];
+      for (const key of FEATURE_KEYS) {
+        const meta = FEATURES[key]!;
+        const on = map[key];
+        lines.push(
+          `• ${escapeHtml(meta.label)} — ${on ? "🟢 ON" : "🔴 OFF"}\n` +
+          `  ${escapeHtml(meta.blurb)} · key: <code>${key}</code>`,
+        );
+      }
+      lines.push(
+        "",
+        "Toggle one: <code>/feature " + escapeHtml(target.id) + " &lt;key&gt; &lt;on|off&gt;</code>",
+        `Example: <code>/feature ${escapeHtml(target.id)} port_watch off</code>`,
+      );
+      await sendMessage(env, ctx.chatId, lines.join("\n"), { parseMode: "HTML" });
+      return;
+    }
+
+    if (args.length < 3) {
+      await sendMessage(env, ctx.chatId,
+        "Usage: /feature <target> <key> <on|off>\n" +
+        `Keys: ${FEATURE_KEYS.join(" · ")}`);
+      return;
+    }
+
+    const key = args[1]!.toLowerCase().replace(/-/g, "_") as FeatureKey;
+    if (!(FEATURE_KEYS as string[]).includes(key)) {
+      await sendMessage(env, ctx.chatId, `Unknown feature "${args[1]}".\nKeys: ${FEATURE_KEYS.join(" · ")}`);
+      return;
+    }
+
+    const raw = args[2]!.toLowerCase();
+    if (raw !== "on" && raw !== "off") {
+      await sendMessage(env, ctx.chatId, "State must be on or off.\nExample: /feature example.com port_watch off");
+      return;
+    }
+    if (key === "nuclei" && raw === "on") {
+      await sendMessage(env, ctx.chatId,
+        `⚠️ <b>${escapeHtml(FEATURES.nuclei.label)}</b> needs an external runner, ` +
+        `which this bot doesn't have — it stays 🔴 OFF. ` +
+        `Turning it on here changes nothing until a runner exists.`,
+        { parseMode: "HTML" });
+      return;
+    }
+
+    await setFeature(env.DB, target.id, key, raw === "on", actor);
+    const emoji = raw === "on" ? "🟢" : "🔴";
+    await sendMessage(env, ctx.chatId,
+      `${emoji} <b>${escapeHtml(FEATURES[key]!.label)}</b> is now <b>${raw.toUpperCase()}</b> for ${escapeHtml(target.name)}.` +
+      (raw === "off" ? "\nThat phase is skipped entirely from the next scan pass." : ""),
+      { parseMode: "HTML" });
+  },
+
+  allow: async (env, ctx, args) => {
+    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /allow <telegram_id>"); return; }
+    const id = args[0]!.replace(/\D/g, "");
+    if (!id) { await sendMessage(env, ctx.chatId, "That doesn't look like a Telegram ID (numeric)."); return; }
+    await addAllowedUser(env.DB, id, ctx.user ? String(ctx.user.id) : null);
+    await sendMessage(env, ctx.chatId, `✅ User ${id} can now use this bot.`);
+  },
+
+  disallow: async (env, ctx, args) => {
+    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /disallow <telegram_id>"); return; }
+    const id = args[0]!.replace(/\D/g, "");
+    if ((env.AUTHORIZED_TELEGRAM_IDS ?? "").split(",").map((s) => s.trim()).includes(id)) {
+      await sendMessage(env, ctx.chatId, `⚠️ ${id} is in the AUTHORIZED_TELEGRAM_IDS env var — remove it there to revoke access (it is re-seeded on every boot).`);
+      return;
+    }
+    const removed = await removeAllowedUser(env.DB, id);
+    await sendMessage(env, ctx.chatId, removed ? `🚫 User ${id} revoked.` : `User ${id} was not in the runtime allowlist.`);
   },
 };

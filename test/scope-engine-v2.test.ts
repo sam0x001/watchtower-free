@@ -97,7 +97,7 @@ describe("hardened scope engine (v2)", () => {
   });
 
   it("denies when no scope exists for target", () => {
-    const d = evaluateScope("api.example.com", [], {});
+    const d = evaluateScope("api.acme-corp.com", [], {});
     expect(d.allowed).toBe(false);
     expect(d.reason).toContain("no scope");
   });

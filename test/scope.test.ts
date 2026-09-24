@@ -12,7 +12,7 @@ function makeTarget(overrides: Partial<Target> = {}): Target {
   return {
     id: "TGT_test",
     organization_id: "ORG_test",
-    name: "example.com",
+    name: "acme-corp.com",
     passive_only: true,
     low_impact_active: false,
     intrusive_enabled: false,
@@ -28,21 +28,21 @@ function makeTarget(overrides: Partial<Target> = {}): Target {
 }
 
 describe("scope engine", () => {
-  it("allows hosts matching a wildcard domain pattern", () => {
+  it("allows hosts matching the target domain (all subdomains included)", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "domain", value: "acme-corp.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
-    expect(checkHostInScope(compiled, "api.example.com").allowed).toBe(true);
-    expect(checkHostInScope(compiled, "v2.api.example.com").allowed).toBe(true);
-    expect(checkHostInScope(compiled, "example.com").allowed).toBe(true);
+    expect(checkHostInScope(compiled, "api.acme-corp.com").allowed).toBe(true);
+    expect(checkHostInScope(compiled, "v2.api.acme-corp.com").allowed).toBe(true);
+    expect(checkHostInScope(compiled, "acme-corp.com").allowed).toBe(true);
   });
 
   it("rejects out-of-scope hosts", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.acme-corp.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
     expect(checkHostInScope(compiled, "attacker.com").allowed).toBe(false);
@@ -72,38 +72,59 @@ describe("scope engine", () => {
   it("rejects broad wildcards", () => {
     expect(isWildcardTooBroad("*")).toBe(true);
     expect(isWildcardTooBroad("*.com")).toBe(true);
-    expect(isWildcardTooBroad("*.example.com")).toBe(false);
+    expect(isWildcardTooBroad("*.acme-corp.com")).toBe(false);
   });
 
   it("denies hosts in the denylist even when matching an allowlist", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
-      { id: "s2", organization_id: "ORG_test", target_id: "TGT_test", type: "domain", value: "internal.example.com", included: false, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.acme-corp.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s2", organization_id: "ORG_test", target_id: "TGT_test", type: "domain", value: "internal.acme-corp.com", included: false, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
-    expect(checkHostInScope(compiled, "internal.example.com").allowed).toBe(false);
-    expect(checkHostInScope(compiled, "api.example.com").allowed).toBe(true);
+    expect(checkHostInScope(compiled, "internal.acme-corp.com").allowed).toBe(false);
+    expect(checkHostInScope(compiled, "api.acme-corp.com").allowed).toBe(true);
   });
 
-  it("rejects when authorization has expired", () => {
+  it("never expires — a target is monitored until it is removed", () => {
     const target = makeTarget({ authorization_expires_at: "2020-01-01T00:00:00Z" });
     const entries: ScopeEntry[] = [
-      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.acme-corp.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
-    const result = checkHostInScope(compiled, "api.example.com");
-    expect(result.allowed).toBe(false);
-    expect(result.reason).toBe("expired");
+    expect(checkHostInScope(compiled, "api.acme-corp.com").allowed).toBe(true);
+  });
+
+  it("a root-domain scope covers every subdomain (no scope declaration needed)", () => {
+    const target = makeTarget();
+    const entries: ScopeEntry[] = [
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "domain", value: "acme-corp.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+    ];
+    const compiled = compileScope(target, entries);
+    expect(checkHostInScope(compiled, "acme-corp.com").allowed).toBe(true);
+    expect(checkHostInScope(compiled, "api.acme-corp.com").allowed).toBe(true);
+    expect(checkHostInScope(compiled, "deep.v2.api.acme-corp.com").allowed).toBe(true);
+    expect(checkHostInScope(compiled, "notacme-corp.com").allowed).toBe(false);
+  });
+
+  it("an excluded path is denied while the rest of the host stays in scope", () => {
+    const target = makeTarget();
+    const entries: ScopeEntry[] = [
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "domain", value: "acme-corp.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s2", organization_id: "ORG_test", target_id: "TGT_test", type: "url", value: "https://acme-corp.com/excluded", included: false, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+    ];
+    const compiled = compileScope(target, entries);
+    expect(checkUrlInScope(compiled, "https://acme-corp.com/excluded/page").allowed).toBe(false);
+    expect(checkUrlInScope(compiled, "https://acme-corp.com/other").allowed).toBe(true);
   });
 
   it("URL scope check enforces host + URL prefix", () => {
     const target = makeTarget();
     const entries: ScopeEntry[] = [
-      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.example.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
+      { id: "s1", organization_id: "ORG_test", target_id: "TGT_test", type: "wildcard_domain", value: "*.acme-corp.com", included: true, notes: null, created_at: "2024-01-01T00:00:00Z", expires_at: null, paused: false },
     ];
     const compiled = compileScope(target, entries);
-    expect(checkUrlInScope(compiled, "https://api.example.com/v1/users").allowed).toBe(true);
+    expect(checkUrlInScope(compiled, "https://api.acme-corp.com/v1/users").allowed).toBe(true);
     expect(checkUrlInScope(compiled, "https://attacker.com/v1/users").allowed).toBe(false);
   });
 
@@ -120,7 +141,7 @@ describe("scope engine", () => {
   it("returns 'no_scope' when no allowlist entries exist", () => {
     const target = makeTarget();
     const compiled = compileScope(target, []);
-    const result = checkHostInScope(compiled, "api.example.com");
+    const result = checkHostInScope(compiled, "api.acme-corp.com");
     expect(result.allowed).toBe(false);
     expect(result.reason).toBe("no_scope");
   });

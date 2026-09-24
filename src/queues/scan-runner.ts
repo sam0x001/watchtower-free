@@ -1,66 +1,192 @@
 // src/queues/scan-runner.ts
-// Synchronous scan runner — replaces the v2 queue consumer.
+// Core scan pipeline. One bounded pass over a target per invocation:
 //
-// Invoked directly from the cron handler with `ctx.waitUntil()`. Reads pending
-// scan jobs from the `job_queue` D1 table (one at a time, bounded by CPU
-// budget), runs the discovery pipeline, and writes any alerts back to
-// `job_queue` as `notification` jobs for the next cron tick to dispatch.
+//   passive (CT logs + DoH DNS)  →  subdomain bruteforce chunk  →  HTTP probe
+//   rotation (services, technologies, CVE matching, JS analysis, fuzzing)
 //
-// Free-tier constraints respected:
-//   - Each job runs in the cron handler's `ctx.waitUntil()` window
-//   - We claim at most FREE_TIER_MAX_JOBS_PER_CRON jobs per invocation
-//   - Each job has a wall-clock timeout (FREE_TIER_SCAN_TIMEOUT_MS)
-//   - Per-target locks prevent concurrent runs (D1-based)
-//   - Rate limits apply before each HTTP request (D1-based)
-//   - Any job that throws is marked failed + retried up to max_attempts
+// Everything is chunked so it fits the Cloudflare Workers free tier:
+//   * a wall-clock deadline (FREE_TIER_SCAN_TIMEOUT_MS) is checked between
+//     hosts, so a pass always finishes inside the invocation window;
+//   * the bruteforce wordlist and the fuzz wordlists keep their cursor in KV and
+//     advance a bounded slice per tick;
+//   * HTTP probes are rotated with `assets.last_probed`, so every subdomain is
+//     eventually probed without probing all of them at once;
+//   * a per-target D1 lock (table `locks`) keeps two ticks from scanning the
+//     same target concurrently.
+//
+// No alert is ever sent from here directly: alerts are returned to the caller,
+// which either enqueues `notification` jobs (cron path) or writes them straight
+// into the chat (the /scan path, so the operator sees first results immediately).
 
 import type { Env } from "../env.js";
-import type { AuditActorKind } from "../types.js";
+import { num } from "../env.js";
+import { LIMITS } from "../constants.js";
 import { getTargetById, listScopeEntries } from "../db/queries/targets.js";
-import { compileScope, isScopeExpired, checkHostInScope } from "../security/scope.js";
-import { EmergencyStopClient } from "../db/emergency-stop.js";
+import { getFeatureMap, type FeatureMap } from "../db/queries/features.js";
+import { compileScope, checkHostInScope, checkUrlInScope, type CompiledScope } from "../scope/index.js";
 import { LockClient } from "../db/distributed-lock.js";
+import { upsertAsset, upsertService, upsertTechnology } from "../db/queries/assets.js";
 import { discoverAssetsForTarget } from "../modules/asset-discovery.js";
 import { analyzeJsForAsset } from "../modules/js-analyzer.js";
+import { matchCvesForTech } from "../modules/cve-matcher.js";
+import { getWildcardIps, runBruteforceChunk } from "../modules/dns-bruteforce.js";
+import { runFuzzChunk, FUZZ_PROFILE } from "../modules/wordlist.js";
 import { HttpxProvider } from "../providers/http/httpx-adapter.js";
-import { log as defaultLog, D1AuditLogger } from "../audit/logger.js";
-import { randomId } from "../crypto/hash.js";
-import {
-  upsertAsset,
-  upsertService,
-  upsertTechnology,
-} from "../db/queries/assets.js";
-import {
-  claimPendingJobs,
-  completeJob,
-  failJob,
-  enqueueJob,
-} from "../db/job-queue.js";
-import type { Alert } from "../modules/alerts.js";
-import { buildAlert } from "../modules/alerts.js";
-import { num } from "../env.js";
+import type { ProviderContext } from "../providers/types.js";
+import { buildAlert, type Alert } from "../modules/alerts.js";
+import { claimPendingJobs, completeJob, failJob, enqueueJob } from "../db/job-queue.js";
+import { log, newRequestId, type ConsoleLogger } from "../lib/console-logger.js";
+import { sendMessage } from "../telegram/webhook.js";
 
-/**
- * Mirror the job_queue lifecycle onto the canonical `scans` row.
- *
- * A scan is tracked in two places: the `job_queue` row the dispatcher claims,
- * and the `scans` row created by /scan_passive (status 'queued'). Only the
- * former was ever advanced, so /scan_status and /scan_history reported every
- * scan as "queued" forever, even after the work had finished.
- *
- * Jobs enqueued by the cron handler use a synthetic scan id and have no
- * `scans` row, so the UPDATE simply matches zero rows for them.
- */
+export type ScanTrigger = "manual" | "cron" | "continuation";
+
+// ---------------------------------------------------------------------------
+// Port rotation (port_watch)
+//
+// Fourteen common HTTP(S) ports, rotated one port per probed host per tick so
+// the extra probes stay inside the free-tier budget:
+//   80 443 8080 8443 8000 8888 3000 5000 8001 8081 8444 9443 9000 7001
+// 80/443 are always covered by the main probes; the rotation covers the rest
+// plus a periodic re-check of 80/443 themselves.
+// ---------------------------------------------------------------------------
+
+/** Non-standard ports rotated one-per-host through the probe queue. */
+export const PORT_WATCH_ROTATION = [8080, 8443, 8000, 8888, 3000, 5000, 8001, 8081, 8444, 9443, 9000, 7001] as const;
+
+function isHttpsPort(port: number): boolean {
+  return port === 443 || port === 8443 || port === 8444 || port === 9443;
+}
+
+/** KV cursor for the port rotation: `pw:<targetId>` (index into the array). */
+async function portCursor(env: Env, targetId: string): Promise<number> {
+  try {
+    const raw = await env.CACHE.get(`pw:${targetId}`);
+    const n = raw ? Number(raw) : 0;
+    return Number.isFinite(n) && n >= 0 ? n % PORT_WATCH_ROTATION.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function savePortCursor(env: Env, targetId: string, index: number): Promise<void> {
+  try {
+    await env.CACHE.put(`pw:${targetId}`, String(index));
+  } catch {
+    // A lost cursor only means the rotation restarts — never fatal.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Result shapes
+// ---------------------------------------------------------------------------
+
+export interface ScanStats {
+  /** Subdomains recorded for the first time during this pass. */
+  subdomainsFound: number;
+  /** Hosts that answered an HTTP probe during this pass. */
+  liveHosts: number;
+  /** Technologies fingerprinted for the first time. */
+  newTechs: number;
+  /** Secret candidates recorded for the first time (values are never stored). */
+  secretsFound: number;
+  /** CVE matches recorded for the first time. */
+  cvesFound: number;
+  /** Sensitive paths recorded for the first time by the wordlist fuzzer. */
+  fuzzFindings: number;
+  /** Fuzz requests attempted during this pass. */
+  fuzzRequests: number;
+  /** Bruteforce hits discarded because they only resolved to wildcard IPs. */
+  wildcardSkipped: number;
+  /** Passive-phase assets the scope refused (exclusions / out of scope). */
+  outOfScope: number;
+  /** Exactly how many hosts were probed this pass. */
+  hostsProbed: number;
+  /** Ports probed this pass (port_watch shares the same rotation slot). */
+  portsProbed: number;
+  /** Ports that answered on a non-standard port (alerts ride the same list). */
+  portsOpen: number;
+  /** Bruteforce cursor bookkeeping for the /scan summary. */
+  bruteforce: { resolved: number; skippedWildcard: number; cursor: number; total: number; done: boolean } | null;
+  /** First few new subdomains — used by the /scan summary message. */
+  topSubdomains: string[];
+  /** True when the pass stopped early because the wall-clock budget ran out. */
+  deadlineReached: boolean;
+  errors: string[];
+}
+
+export interface ScanRunResult {
+  ok: boolean;
+  /** Present when ok === false. */
+  error?: string;
+  /** False when retrying the same scan can never succeed (paused/missing target). */
+  retryable: boolean;
+  targetId: string;
+  targetName: string;
+  organizationId: string;
+  alerts: Alert[];
+  stats: ScanStats;
+}
+
+export interface ScanRunOptions {
+  trigger?: ScanTrigger;
+  /** `scans.id` row to mirror the lifecycle onto. */
+  scanId?: string | null;
+  /** `job_queue.id` that caused this run (lock holder id + log correlation). */
+  jobId?: string | null;
+  /** Wall-clock budget override (the /scan path uses a tighter budget). */
+  deadlineMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Budget used by the inline /scan pass (the webhook must answer quickly). */
+export const INLINE_SCAN_BUDGET_MS = 40_000;
+
+/** Maximum high/critical alerts pushed inline by /scan (the rest ride the cron). */
+const INLINE_ALERT_LIMIT = 8;
+
+function emptyStats(): ScanStats {
+  return {
+    subdomainsFound: 0, liveHosts: 0, newTechs: 0, secretsFound: 0,
+    cvesFound: 0, fuzzFindings: 0, fuzzRequests: 0, wildcardSkipped: 0,
+    outOfScope: 0, hostsProbed: 0, portsProbed: 0, portsOpen: 0, bruteforce: null,
+    topSubdomains: [], deadlineReached: false, errors: [],
+  };
+}
+
+function providerCtx(env: Env, logger: ConsoleLogger): ProviderContext {
+  return {
+    maxResponseBytes: LIMITS.MAX_CERT_PROVIDER_RESPONSE_BYTES,
+    timeoutMs: 15_000,
+    cache: env.CACHE,
+    userAgent: env.USER_AGENT,
+    log: (m: string, f?: Record<string, unknown>) => logger.info(m, f),
+  };
+}
+
+/** Findings-style counters packaged for the `scans` row. */
+function changesDetected(stats: ScanStats): number {
+  return stats.subdomainsFound + stats.liveHosts + stats.newTechs + stats.cvesFound + stats.fuzzFindings;
+}
+
+/** Mirror the job_queue lifecycle onto the canonical `scans` row. */
 async function updateScanRow(
   db: D1Database,
-  scanId: string | undefined,
+  scanId: string | null | undefined,
   status: "queued" | "running" | "completed" | "failed",
-  opts: { stop_reason?: string | null; errors?: string[]; reset_started?: boolean } = {},
+  opts: {
+    stop_reason?: string | null;
+    errors?: string[];
+    stats?: ScanStats;
+    reset_started?: boolean;
+  } = {},
 ): Promise<void> {
   if (!scanId) return;
   const now = new Date().toISOString();
   const sets = ["status = ?", "updated_at = ?"];
-  const binds: (string | null)[] = [status, now];
+  const binds: (string | number | null)[] = [status, now];
 
   if (status === "running") {
     sets.push("started_at = ?");
@@ -81,291 +207,763 @@ async function updateScanRow(
     sets.push("errors_json = ?");
     binds.push(JSON.stringify(opts.errors.slice(0, 20)));
   }
+  if (opts.stats) {
+    sets.push("assets_seen = ?", "changes_detected = ?", "findings_created = ?");
+    binds.push(
+      opts.stats.subdomainsFound + opts.stats.hostsProbed,
+      changesDetected(opts.stats),
+      opts.stats.secretsFound + opts.stats.cvesFound + opts.stats.fuzzFindings,
+    );
+  }
   binds.push(scanId);
 
-  // Never resurrect a scan the operator already terminated (cancel / estop).
+  // Never resurrect a scan the operator already cancelled.
   await db
-    .prepare(
-      `UPDATE scans SET ${sets.join(", ")} WHERE id = ? ` +
-      `AND status NOT IN ('cancelled','stopped','scope_denied')`,
-    )
+    .prepare(`UPDATE scans SET ${sets.join(", ")} WHERE id = ? AND status NOT IN ('cancelled')`)
     .bind(...binds)
     .run();
 }
 
+/** True when an identical alert was already delivered inside the dedupe window. */
+async function notificationAlreadySent(db: D1Database, dedupeKey: string): Promise<boolean> {
+  const cutoff = new Date(Date.now() - LIMITS.NOTIFICATION_DEDUPE_WINDOW_HOURS * 3_600_000).toISOString();
+  const row = await db
+    .prepare(`SELECT id FROM notifications WHERE dedupe_key = ? AND status = 'sent' AND created_at > ? LIMIT 1`)
+    .bind(dedupeKey, cutoff)
+    .first<{ id: string }>();
+  return !!row;
+}
+
+/** Record an alert as already delivered (baseline) so the cron never re-sends it. */
+async function recordNotificationSent(
+  db: D1Database,
+  alert: Alert,
+  targetId: string,
+  organizationId: string,
+  destination: string,
+): Promise<void> {
+  const now = new Date().toISOString();
+  const id = `notif_${crypto.randomUUID()}`;
+  await db
+    .prepare(
+      `INSERT INTO notifications (
+         id, organization_id, target_id, finding_id, channel, destination,
+         alert_type, severity, title, body_redacted, dedupe_key, status,
+         attempts, sent_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, 'telegram', ?, ?, ?, ?, ?, ?, 'sent', 1, ?, ?, ?)`,
+    )
+    .bind(
+      id, organizationId, targetId,
+      (alert.metadata["finding_id"] as string | undefined) ?? null,
+      destination, alert.type, alert.severity, alert.title,
+      alert.summary.slice(0, 4000), alert.dedup_key, now, now, now,
+    )
+    .run();
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function collectSubdomainStats(batch: Alert[], stats: ScanStats): void {
+  for (const a of batch) {
+    if (a.type !== "new_subdomain") continue;
+    stats.subdomainsFound++;
+    const value = String(a.metadata["asset_value"] ?? "");
+    if (value && stats.topSubdomains.length < 10) stats.topSubdomains.push(value);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The scan pass
+// ---------------------------------------------------------------------------
+
+/**
+ * Run ONE bounded scan pass for `targetId`.
+ *
+ * The caller owns the job/scan lifecycle — this function only takes the
+ * per-target lock, does the work, and reports what it found.
+ */
+export async function runScanForTarget(
+  env: Env,
+  targetId: string,
+  opts: ScanRunOptions = {},
+): Promise<ScanRunResult> {
+  const logger = log;
+  const stats = emptyStats();
+  const alerts: Alert[] = [];
+  const trigger: ScanTrigger = opts.trigger ?? "cron";
+
+  // ---- 1. Target + scope -------------------------------------------------
+  const target = await getTargetById(env.DB, targetId);
+  if (!target) {
+    return { ok: false, error: "target not found", retryable: false, targetId, targetName: "", organizationId: "", alerts, stats };
+  }
+  if (target.paused) {
+    return { ok: false, error: "target is paused", retryable: false, targetId, targetName: target.name, organizationId: target.organization_id, alerts, stats };
+  }
+
+  const scopeEntries = await listScopeEntries(env.DB, targetId);
+  const scope: CompiledScope = compileScope(target, scopeEntries);
+  const host = target.name;
+
+  // Per-target feature toggles (defaults keep every existing target fully on,
+  // except nuclei which needs a runner the bot doesn't have).
+  const features: FeatureMap = await getFeatureMap(env.DB, targetId);
+
+  // ---- 2. Per-target lock ------------------------------------------------
+  const holderId = opts.jobId ? `scan:${opts.jobId}` : `scan:${newRequestId()}`;
+  const budgetMs = opts.deadlineMs ?? num(env.FREE_TIER_SCAN_TIMEOUT_MS, 60_000);
+  const lock = new LockClient(env.DB, `target:${targetId}`);
+  const locked = await lock.acquire(holderId, budgetMs + 60_000);
+  if (!locked) {
+    return {
+      ok: false, error: "target busy (another scan is running)", retryable: true,
+      targetId, targetName: target.name, organizationId: target.organization_id, alerts, stats,
+    };
+  }
+
+  const deadline = Date.now() + budgetMs;
+  const pctx = providerCtx(env, logger);
+
+  try {
+    logger.info("scan.start", { targetId, host, trigger, budgetMs, scopeEntries: scopeEntries.length });
+
+    // ---- 3. Passive phase: certificate transparency + DNS records --------
+    // A disabled subdomain_enum skips the CT/DoH providers entirely.
+    if (features.subdomain_enum) {
+      const discovery = await discoverAssetsForTarget(env, targetId, host, scope, logger);
+      alerts.push(...discovery.alerts);
+      stats.outOfScope += discovery.outOfScope;
+      stats.errors.push(...discovery.errors);
+      collectSubdomainStats(discovery.alerts, stats);
+    }
+
+    // ---- 4. Bruteforce phase: one bounded chunk of the wordlist ----------
+    if (features.dns_brute && Date.now() < deadline) {
+      const wildcardIps = await getWildcardIps(env, targetId, host, pctx);
+      const bf = await runBruteforceChunk(
+        env, targetId, host, scope, wildcardIps, pctx,
+        num(env.BRUTEFORCE_CHUNK, 300),
+        num(env.BRUTEFORCE_CONCURRENCY, 16),
+      );
+      alerts.push(...bf.alerts);
+      stats.wildcardSkipped += bf.skippedWildcard;
+      stats.bruteforce = {
+        resolved: bf.resolved, skippedWildcard: bf.skippedWildcard,
+        cursor: bf.cursor, total: bf.total, done: bf.done,
+      };
+      collectSubdomainStats(bf.alerts, stats);
+    } else {
+      stats.deadlineReached = true;
+    }
+
+    // ---- 5. Probe rotation (never-probed / least-recently-probed first) --
+    const due = await env.DB
+      .prepare(
+        `SELECT id, identifier FROM assets
+          WHERE target_id = ? AND asset_type = 'subdomain' AND status = 'active'
+            AND scope_state = 'allowed'
+          ORDER BY (last_probed IS NULL) DESC, last_probed ASC, first_seen ASC
+          LIMIT ?`,
+      )
+      .bind(targetId, num(env.PROBE_LIMIT_PER_SCAN, 5))
+      .all<{ id: string; identifier: string }>();
+
+    for (const asset of due.results ?? []) {
+      if (Date.now() >= deadline) {
+        stats.deadlineReached = true;
+        break;
+      }
+      const outcome = await probeHost(
+        env, targetId, asset.identifier, scope, pctx, features, deadline,
+      );
+      alerts.push(...outcome.alerts);
+      stats.hostsProbed++;
+      if (outcome.live) stats.liveHosts++;
+      stats.portsProbed += outcome.portsProbed;
+      stats.portsOpen += outcome.portsOpen;
+      stats.newTechs += outcome.newTechs;
+      stats.secretsFound += outcome.secretsFound;
+      stats.cvesFound += outcome.cvesFound;
+      stats.fuzzFindings += outcome.fuzzFindings;
+      stats.fuzzRequests += outcome.fuzzRequests;
+      stats.errors.push(...outcome.errors);
+
+      const now = new Date().toISOString();
+      await env.DB
+        .prepare(`UPDATE assets SET last_probed = ?, last_seen = ? WHERE id = ?`)
+        .bind(now, now, asset.id)
+        .run();
+    }
+
+    logger.info("scan.complete", {
+      targetId, host, trigger, alerts: alerts.length,
+      subdomains: stats.subdomainsFound, live: stats.liveHosts, techs: stats.newTechs,
+      secrets: stats.secretsFound, cves: stats.cvesFound, fuzz: stats.fuzzFindings,
+      hostsProbed: stats.hostsProbed, deadlineReached: stats.deadlineReached,
+    });
+
+    return {
+      ok: true, retryable: true, targetId, targetName: target.name,
+      organizationId: target.organization_id, alerts, stats,
+    };
+  } catch (err) {
+    logger.error("scan.failed", { targetId, err: String(err) });
+    stats.errors.push(String(err));
+    return {
+      ok: false, error: String(err), retryable: true, targetId,
+      targetName: target.name, organizationId: target.organization_id, alerts, stats,
+    };
+  } finally {
+    await lock.release(holderId).catch(() => undefined);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Single-host probing
+// ---------------------------------------------------------------------------
+
+interface HostProbeOutcome {
+  alerts: Alert[];
+  live: boolean;
+  portsProbed: number;
+  portsOpen: number;
+  newTechs: number;
+  secretsFound: number;
+  cvesFound: number;
+  fuzzFindings: number;
+  fuzzRequests: number;
+  errors: string[];
+}
+
+/** KV cursor for the fuzz wordlists: `fuzz:<targetId>:<host>`. */
+async function fuzzCursor(env: Env, targetId: string, host: string): Promise<number> {
+  try {
+    const raw = await env.CACHE.get(`fuzz:${targetId}:${host}`);
+    if (!raw) return 0;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function saveFuzzCursor(env: Env, targetId: string, host: string, offset: number): Promise<void> {
+  try {
+    await env.CACHE.put(`fuzz:${targetId}:${host}`, String(offset));
+  } catch {
+    // A lost cursor only means the wordlist restarts — never fatal.
+  }
+}
+
+/**
+ * Probe one host: HTTP service + technologies + CVE matches, then (only for a
+ * real page) JavaScript analysis, one chunk of wordlist fuzzing, and the one
+ * rotated extra port for the tick.
+ *
+ * The target's feature map gates every phase: disabled work costs zero
+ * requests. `status_watch` gates service/tech storage + change alerts (status
+ * and redirect changes included); `fuzz_files` gates the common-file fuzz
+ * chunk; `deep_fuzz` doubles it on freshly created URL assets; `js_changes`
+ * gates JS discovery; `port_watch` gates the extra-port rotation.
+ */
+async function probeHost(
+  env: Env,
+  targetId: string,
+  host: string,
+  scope: CompiledScope,
+  pctx: ProviderContext,
+  features: FeatureMap,
+  deadline: number,
+): Promise<HostProbeOutcome> {
+  const out: HostProbeOutcome = {
+    alerts: [], live: false, portsProbed: 0, portsOpen: 0,
+    newTechs: 0, secretsFound: 0,
+    cvesFound: 0, fuzzFindings: 0, fuzzRequests: 0, errors: [],
+  };
+
+  // Freshness: the URL asset didn't exist before this probe. Passing it to
+  // the fuzz stage makes `deep_fuzz` a deeper pass on NEW hosts only.
+  let freshHost = false;
+
+  // Exclusions are honoured BEFORE a single packet is sent.
+  const scopeCheck = checkHostInScope(scope, host);
+  if (!scopeCheck.allowed) {
+    out.errors.push(`skipped ${host}: ${scopeCheck.reason}`);
+    return out;
+  }
+
+  const httpx = new HttpxProvider();
+  let probe = await httpx.probeUrl(`https://${host}/`, host, pctx, scope);
+  if (!probe) probe = await httpx.probeUrl(`http://${host}/`, host, pctx, scope);
+  if (!probe) return out; // nothing answered on 443 or 80
+  out.live = true;
+
+  // A redirect (3xx final URL on another host) carries no fingerprintable body.
+  // It is still a change worth reporting, then probing stops here.
+  if (probe.status >= 300 && probe.status < 400) {
+    return out;
+  }
+
+  // ---- URL asset + HTTP service -----------------------------------------
+  const urlAsset = await upsertAsset(env.DB, targetId, "url", probe.finalUrl, probe.finalUrl, "in_scope", {
+    title: probe.title, server: probe.server, status: probe.status,
+  });
+  freshHost = urlAsset.created;
+
+  // With status_watch OFF the service row is neither stored nor alerted on —
+  // the probe result then feeds only tech/CVE/JS/fuzz stages below.
+  if (features.status_watch) {
+    const port = probe.url.startsWith("https://") ? 443 : 80;
+    const svc = await upsertService(
+      env.DB, urlAsset.id, port, "tcp", null, null, probe.status, probe.title, probe.server,
+    );
+
+    if (svc.created) {
+      out.alerts.push(buildAlert("new_service", targetId, {
+        asset_id: urlAsset.id,
+        asset_value: probe.finalUrl,
+        title: `Live host: ${host}`,
+        summary:
+          `A new in-scope HTTP service answered.\n\n` +
+          `URL: ${probe.finalUrl}\nStatus: ${probe.status}\n` +
+          `Title: ${probe.title ?? "—"}\nServer: ${probe.server ?? "—"}`,
+        metadata: {
+          url: probe.finalUrl, status: probe.status,
+          title: probe.title, server: probe.server, port,
+        },
+      }));
+    }
+
+    for (const change of svc.changes) {
+      const alertType = change.field === "title"
+        ? "service_title_changed"
+        : change.field === "status"
+          ? "service_status_changed"
+          : "service_header_changed";
+      const label = change.field === "title"
+        ? "Page title"
+        : change.field === "status"
+          ? "HTTP status"
+          : "Server header";
+      out.alerts.push(buildAlert(alertType, targetId, {
+        asset_id: urlAsset.id,
+        asset_value: probe.finalUrl,
+        title: `${label} changed on ${host}`,
+        summary:
+          `An in-scope HTTP service changed.\n\n` +
+          `URL: ${probe.finalUrl}\nField: ${label}\nBefore: ${change.before}\nAfter: ${change.after}\n\n` +
+          `Usually a deployment — worth a look if you did not ship it.`,
+        metadata: { url: probe.finalUrl, field: change.field, before: change.before, after: change.after },
+      }, change.field === "status" ? "medium" : "low"));
+    }
+  }
+
+  // ---- Technologies + CVE matching (gated by status_watch) ---------------
+  if (features.status_watch) {
+    for (const tech of probe.technologies) {
+      const techRes = await upsertTechnology(env.DB, urlAsset.id, tech.name, tech.version, 0.7, "httpx-worker");
+
+      if (techRes.created) {
+        out.newTechs++;
+        out.alerts.push(buildAlert("new_technology", targetId, {
+          asset_id: urlAsset.id,
+          asset_value: `${host}:${tech.name}`,
+          title: `New technology on ${host}: ${tech.name}${tech.version ? ` ${tech.version}` : ""}`,
+          summary:
+            `A technology was fingerprinted on an in-scope host.\n\n` +
+            `Host: ${host}\nURL: ${probe.finalUrl}\n` +
+            `Technology: ${tech.name}${tech.version ? ` ${tech.version}` : " (version unknown)"}\nConfidence: 70%`,
+          metadata: { url: probe.finalUrl, technology: tech.name, version: tech.version },
+        }));
+      } else if (techRes.versionChanged) {
+        out.alerts.push(buildAlert("technology_version_changed", targetId, {
+          asset_id: urlAsset.id,
+          asset_value: `${host}:${tech.name}`,
+          title: `${tech.name} version changed on ${host}`,
+          summary:
+            `A fingerprinted technology changed version.\n\n` +
+            `Host: ${host}\nTechnology: ${tech.name}\n` +
+            `Before: ${techRes.previousVersion ?? "unknown"}\nAfter: ${tech.version ?? "unknown"}`,
+          metadata: {
+            url: probe.finalUrl, technology: tech.name,
+            before: techRes.previousVersion, after: tech.version,
+          },
+        }, "medium"));
+      }
+
+      // CVE correlation only makes sense for versioned, mapped technologies.
+      if (Date.now() < deadline) {
+        const cve = await matchCvesForTech(env, targetId, urlAsset.id, host, probe.finalUrl, tech, pctx);
+        out.cvesFound += cve.newCves;
+        out.alerts.push(...cve.alerts);
+      }
+    }
+  }
+
+  // Deeper passive work needs a real page, not an error response.
+  if (probe.status >= 400) return out;
+
+  // ---- JavaScript discovery + secret scan (gated by js_changes) ----------
+  if (features.js_changes) {
+    const js = await analyzeJsForAsset(
+      env, targetId, urlAsset.id, probe.finalUrl, scope,
+      env.REDACTION_SALT ?? "fallback-redaction-salt",
+    );
+    out.alerts.push(...js.alerts);
+    out.secretsFound += js.redactedSecretsStored;
+    out.errors.push(...js.errors);
+  }
+
+  // ---- Common-file fuzz chunk (gated by fuzz_files) ----------------------
+  // Freshly discovered hosts get a doubled slice when deep_fuzz is on.
+  if (features.fuzz_files && Date.now() < deadline) {
+    const budget = freshHost && features.deep_fuzz
+      ? num(env.FUZZ_REQUESTS_PER_TICK, 40) * 2
+      : num(env.FUZZ_REQUESTS_PER_TICK, 40);
+    const offset = await fuzzCursor(env, targetId, host);
+    const fuzz = await runFuzzChunk(env, probe.finalUrl, targetId, scope, offset, {
+      ...FUZZ_PROFILE,
+      maxRequests: budget,
+    });
+    out.fuzzRequests += fuzz.results.length;
+    out.fuzzFindings += fuzz.alerts.length;
+    out.alerts.push(...fuzz.alerts);
+    if (fuzz.newOffset !== offset || fuzz.done) {
+      await saveFuzzCursor(env, targetId, host, fuzz.done ? 0 : fuzz.newOffset);
+    }
+  }
+
+  // ---- Extra port for the tick (gated by port_watch) ---------------------
+  if (features.port_watch && Date.now() < deadline) {
+    const index = await portCursor(env, targetId);
+    const port = PORT_WATCH_ROTATION[index]!;
+    await savePortCursor(env, targetId, (index + 1) % PORT_WATCH_ROTATION.length);
+    const portOutcome = await probePort(env, targetId, urlAsset.id, host, port, scope, pctx);
+    out.portsProbed += portOutcome.probed ? 1 : 0;
+    out.portsOpen += portOutcome.open ? 1 : 0;
+    out.alerts.push(...portOutcome.alerts);
+  }
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Extra-port probing (port_watch)
+//
+// One non-standard port per probed host per tick: the URL is scope-checked
+// like everything else, and an answering service is stored/compared with the
+// same service machinery — so re-runs only alert on real changes.
+// ---------------------------------------------------------------------------
+
+interface PortProbeOutcome {
+  probed: boolean;
+  open: boolean;
+  alerts: Alert[];
+}
+
+async function probePort(
+  env: Env,
+  targetId: string,
+  urlAssetId: string,
+  host: string,
+  port: number,
+  scope: CompiledScope,
+  pctx: ProviderContext,
+): Promise<PortProbeOutcome> {
+  const scheme = isHttpsPort(port) ? "https" : "http";
+  const url = `${scheme}://${host}:${port}/`;
+  const checked = checkUrlInScope(scope, url);
+  if (!checked.allowed) return { probed: false, open: false, alerts: [] };
+
+  const httpx = new HttpxProvider();
+  let probe = null;
+  try {
+    probe = await httpx.probeUrl(url, host, pctx, scope);
+  } catch {
+    return { probed: true, open: false, alerts: [] };
+  }
+  if (!probe || probe.status >= 500) return { probed: true, open: false, alerts: [] };
+
+  const svc = await upsertService(
+    env.DB, urlAssetId, port, "tcp", null, null, probe.status, probe.title, probe.server,
+  );
+  const alerts: Alert[] = [];
+
+  if (svc.created) {
+    alerts.push(buildAlert("new_service", targetId, {
+      asset_id: urlAssetId,
+      asset_value: probe.finalUrl,
+      title: `Open port on ${host}: ${port}`,
+      summary:
+        `A service answered on a watched non-standard port.\n\n` +
+        `URL: ${probe.finalUrl}\nStatus: ${probe.status}\n` +
+        `Title: ${probe.title ?? "—"}\nServer: ${probe.server ?? "—"}`,
+      metadata: {
+        url: probe.finalUrl, status: probe.status,
+        title: probe.title, server: probe.server, port,
+      },
+    }));
+  }
+
+  for (const change of svc.changes) {
+    alerts.push(buildAlert("service_status_changed", targetId, {
+      asset_id: urlAssetId,
+      asset_value: probe.finalUrl,
+      title: `Service changed on ${host}:${port}`,
+      summary:
+        `A watched port's service changed.\n\n` +
+        `URL: ${probe.finalUrl}\nField: ${change.field}\nBefore: ${change.before}\nAfter: ${change.after}`,
+      metadata: { url: probe.finalUrl, field: change.field, before: change.before, after: change.after, port },
+    }, "medium"));
+  }
+
+  return { probed: true, open: true, alerts };
+}
+
+// ---------------------------------------------------------------------------
+// Cron path: pending scan jobs
+// ---------------------------------------------------------------------------
+
+/**
+ * Claim and run up to FREE_TIER_MAX_JOBS_PER_CRON scan jobs, then turn every
+ * alert they produced into a `notification` job for the dispatcher.
+ */
 export async function runPendingScans(
   env: Env,
-  ctx: ExecutionContext,
+  _ctx: ExecutionContext,
 ): Promise<{ claimed: number; completed: number; failed: number; alertsEnqueued: number }> {
-  const log = defaultLog;
-  const audit = new D1AuditLogger(env.DB);
-  const maxJobsPerCron = num(env.FREE_TIER_MAX_JOBS_PER_CRON, 2);
-  const scanTimeoutMs = num(env.FREE_TIER_SCAN_TIMEOUT_MS, 30_000);
+  const maxJobs = num(env.FREE_TIER_MAX_JOBS_PER_CRON, 2);
+  const timeoutMs = num(env.FREE_TIER_SCAN_TIMEOUT_MS, 60_000);
+  const jobs = await claimPendingJobs(env.DB, "scan", maxJobs, timeoutMs + 30_000);
 
-  const jobs = await claimPendingJobs(env.DB, "scan", maxJobsPerCron, scanTimeoutMs + 30_000);
   let completed = 0;
   let failed = 0;
   let alertsEnqueued = 0;
 
   for (const job of jobs) {
-    const scanId = job.payload["job_id"] as string | undefined;
-    const result = await processScanJob(env, job, audit, log, scanTimeoutMs);
-    if (result.ok) {
-      await completeJob(env.DB, job.id, { summary: `${result.alerts} alerts` });
-      await updateScanRow(env.DB, scanId, "completed");
-      for (const alert of result.alertsArray) {
-        await enqueueJob(env.DB, "notification", {
-          organization_id: result.organizationId,
-          target_id: result.targetId,
-          finding_id: (alert.metadata as Record<string, unknown>).finding_id as string | undefined,
-          channel: "telegram",
-          severity: alert.severity,
-          payload: {
-            title: alert.title,
-            summary: alert.summary,
-            change_type: alert.type,
-            target_id: result.targetId,
-            target_name: result.targetName,
-            ...alert.metadata,
-          },
-          dedup_key: alert.dedup_key,
-          attempt: 0,
-        }, { dedup_key: alert.dedup_key });
-        alertsEnqueued++;
-      }
-      completed++;
-    } else {
-      await failJob(env.DB, job.id, result.error ?? "unknown error", {
-        retry_after_seconds: 60 * (job.attempts + 1),
-      });
+    const targetId = String(job.payload["target_id"] ?? "");
+    const scanId = (job.payload["job_id"] as string | undefined) ?? null;
+    const trigger = (job.payload["triggered_by"] as ScanTrigger | undefined) ?? "cron";
+
+    if (!targetId) {
+      await failJob(env.DB, job.id, "scan job without a target_id");
       failed++;
-      // Only surface a terminal failure on the scan row; a retryable failure
-      // goes back to 'queued' so the next tick can pick it up again.
-      const terminal = job.attempts >= job.max_attempts;
-      await updateScanRow(env.DB, scanId, terminal ? "failed" : "queued", {
-        stop_reason: terminal ? (result.error ?? "unknown error") : null,
-        errors: terminal ? [result.error ?? "unknown error"] : undefined,
-        reset_started: !terminal,
-      });
-      await enqueueJob(env.DB, "notification", {
-        organization_id: result.organizationId,
-        target_id: result.targetId,
-        channel: "telegram",
-        severity: "high",
-        payload: {
-          title: `Scan failed for ${result.targetName}`,
-          summary: `Scan job ${job.id} failed: ${result.error?.slice(0, 500) ?? "unknown error"}`,
-          change_type: "scan_failed",
-          target_id: result.targetId,
-          target_name: result.targetName,
-          scan_job_id: job.id,
-        },
-        dedup_key: `scan_failed:${job.id}`,
-        attempt: 0,
-      }, { dedup_key: `scan_failed:${job.id}` });
+      continue;
     }
+
+    const result = await runScanForTarget(env, targetId, {
+      trigger, scanId, jobId: job.id, deadlineMs: timeoutMs,
+    });
+
+    if (result.ok) {
+      await updateScanRow(env.DB, scanId, "completed", { stats: result.stats });
+      await completeJob(env.DB, job.id, { summary: `${result.alerts.length} alerts` });
+      alertsEnqueued += await enqueueAlertNotifications(env, result);
+      completed++;
+      continue;
+    }
+
+    // A paused or deleted target can never succeed — drop it, don't retry.
+    if (!result.retryable) {
+      await updateScanRow(env.DB, scanId, "failed", { stop_reason: result.error ?? "unknown error" });
+      await completeJob(env.DB, job.id);
+      log.info("scan.skipped", { targetId, reason: result.error ?? "unknown" });
+      continue;
+    }
+
+    const error = result.error ?? "unknown error";
+    await failJob(env.DB, job.id, error, { retry_after_seconds: 60 * Math.max(1, job.attempts) });
+    const terminal = job.attempts >= job.max_attempts;
+    await updateScanRow(env.DB, scanId, terminal ? "failed" : "queued", {
+      stop_reason: terminal ? error : null,
+      errors: [error],
+      reset_started: !terminal,
+    });
+    failed++;
+
+    await enqueueJob(env.DB, "notification", {
+      organization_id: result.organizationId,
+      target_id: targetId,
+      channel: "telegram",
+      severity: "high",
+      payload: {
+        title: `Scan failed for ${result.targetName || targetId}`,
+        summary: `Scan job ${job.id} failed: ${error.slice(0, 500)}`,
+        change_type: "scan_failed",
+        target_id: targetId,
+        target_name: result.targetName,
+        scan_job_id: job.id,
+      },
+      dedup_key: `scan_failed:${job.id}`,
+    }, { dedup_key: `scan_failed:${job.id}` });
   }
 
   return { claimed: jobs.length, completed, failed, alertsEnqueued };
 }
 
-async function processScanJob(
-  env: Env,
-  job: { id: string; payload: Record<string, unknown>; attempts: number; max_attempts: number },
-  audit: D1AuditLogger,
-  log: typeof defaultLog,
-  _scanTimeoutMs: number,
-): Promise<{ ok: true; alerts: number; alertsArray: Alert[]; organizationId: string; targetId: string; targetName: string } | { ok: false; error: string; organizationId: string; targetId: string; targetName: string }> {
-  const requestId = randomId("req", 12);
-  const targetId = job.payload["target_id"] as string;
-  const triggeredByUserId = (job.payload["triggered_by_user_id"] as string | null) ?? null;
-
-  // 1. Check emergency stop (fail-closed)
-  const es = new EmergencyStopClient(env.DB);
-  if (await es.isBlocked("global") || await es.isBlocked("target", targetId)) {
-    return { ok: false, error: "emergency stop active", organizationId: "", targetId, targetName: "" };
-  }
-
-  // 2. Load target & scope
+/**
+ * Run a scan right now (the /scan command) and report the results in chat.
+ *
+ * The operator gets: a "started" message, ONE summary, and the first few
+ * high/critical alerts. Every alert is then baseline-recorded as already sent,
+ * so the 5-minute cron keeps reporting only what is genuinely new after this
+ * initial pass.
+ */
+export async function runInitialScanInline(env: Env, targetId: string, chatId: number): Promise<void> {
   const target = await getTargetById(env.DB, targetId);
-  if (!target) return { ok: false, error: "target not found", organizationId: "", targetId, targetName: "" };
-  if (target.paused) return { ok: false, error: "target paused", organizationId: target.organization_id, targetId, targetName: target.name };
-  if (isScopeExpired(target)) return { ok: false, error: "scope expired", organizationId: target.organization_id, targetId, targetName: target.name };
-
-  const scopeEntries = await listScopeEntries(env.DB, targetId);
-  const scope = compileScope(target, scopeEntries);
-
-  // 3. Acquire a per-target lock via D1 row
-  const lock = new LockClient(env.DB, `target:${targetId}`);
-  const lockHeld = await lock.acquire(`scan:${job.id}`, 5 * 60_000);
-  if (!lockHeld) {
-    return { ok: false, error: "target busy (another scan running)", organizationId: target.organization_id, targetId, targetName: target.name };
+  if (!target) {
+    await sendMessage(env, chatId, "Target not found.");
+    return;
   }
 
-  try {
-    // The scan is now genuinely running — reflect that on the canonical row.
-    await updateScanRow(env.DB, job.payload["job_id"] as string | undefined, "running");
+  const scanId = `scan_${crypto.randomUUID()}`;
+  const now = new Date().toISOString();
+  await env.DB
+    .prepare(
+      `INSERT INTO scans (id, organization_id, target_id, trigger, status, requested_by, started_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'manual', 'running', ?, ?, ?, ?)`,
+    )
+    .bind(scanId, target.organization_id, targetId, String(chatId), now, now, now)
+    .run();
 
-    const alerts: Alert[] = [];
-    const host = target.name;
+  await sendMessage(
+    env, chatId,
+    `🟢 <b>Initial scan of ${escapeHtml(target.name)} started…</b>\n\n` +
+    `Certificate-transparency logs + DNS records, a chunk of the subdomain ` +
+    `wordlist, then live hosts, technologies, CVEs, JavaScript and sensitive-path ` +
+    `fuzzing. Heavy phases continue on the 5-minute schedule.`,
+    { parseMode: "HTML" },
+  );
 
-    // 4. Run CT + DNS discovery
-    const discovery = await discoverAssetsForTarget(env, targetId, host, scope, log);
-    alerts.push(...discovery.alerts);
+  const result = await runScanForTarget(env, targetId, {
+    trigger: "manual", scanId, deadlineMs: INLINE_SCAN_BUDGET_MS,
+  });
 
-    // 5. For each in-scope subdomain, run HTTP probe + JS analysis
-    //    Limited to first 5 assets per scan to respect CPU budget.
-    const assets = await env.DB
-      .prepare(`SELECT id, identifier, display_name FROM assets WHERE target_id = ? AND asset_type = 'subdomain' AND scope_state = 'allowed' ORDER BY last_seen DESC LIMIT 5`)
-      .bind(targetId)
-      .all<{ id: string; identifier: string; display_name: string }>();
+  if (!result.ok) {
+    await updateScanRow(env.DB, scanId, "failed", { stop_reason: result.error ?? "unknown error" });
+    await sendMessage(
+      env, chatId,
+      `❌ Scan of ${escapeHtml(target.name)} failed: ${escapeHtml(result.error ?? "unknown error")}`,
+    );
+    return;
+  }
 
-    const httpx = new HttpxProvider();
-    const providerCtx = {
-      maxResponseBytes: 5 * 1024 * 1024,
-      timeoutMs: 15_000,
-      cache: env.CACHE,
-      userAgent: env.USER_AGENT,
-      log: (m: string, f?: Record<string, unknown>) => log.info(m, f),
-    };
+  await updateScanRow(env.DB, scanId, "completed", {
+    stats: result.stats,
+    stop_reason: result.stats.deadlineReached ? "deadline reached — continues on the next tick" : null,
+  });
+  await sendMessage(env, chatId, summaryMessage(result), { parseMode: "HTML" });
 
-    for (const _a of assets.results ?? []) {
-      const a = { id: _a.id, normalized: _a.identifier, value: _a.display_name };
-      const scopeCheck = checkHostInScope(scope, a.normalized);
-      if (!scopeCheck.allowed) continue;
+  // Then the urgent findings, immediately (bounded so /scan can't spam the chat).
+  let inlineSent = 0;
+  for (const alert of result.alerts) {
+    if (await notificationAlreadySent(env.DB, alert.dedup_key)) continue;
 
-      const probe = await httpx.probeUrl(`https://${a.normalized}/`, a.normalized, providerCtx, scope);
-      if (!probe || probe.status < 200 || probe.status >= 400) continue;
-
-      const urlAsset = await upsertAsset(
-        env.DB, targetId, "url",
-        probe.finalUrl, probe.finalUrl, "in_scope",
-        { title: probe.title, server: probe.server, technologies: probe.technologies },
-      );
-
-      const port = probe.url.startsWith("https://") ? 443 : 80;
-      const svc = await upsertService(
-        env.DB, urlAsset.id, port, "tcp",
-        null, null, probe.status, probe.title, probe.server,
-      );
-
-      if (svc.created) {
-        alerts.push(buildAlert("new_service", targetId, {
-          asset_id: urlAsset.id,
-          asset_value: probe.finalUrl,
-          title: `New HTTP service responding: ${a.normalized}`,
-          summary:
-            `A new in-scope HTTP service responded successfully.\n\n` +
-            `URL: ${probe.finalUrl}\nStatus: ${probe.status}\nTitle: ${probe.title ?? "—"}\nServer: ${probe.server ?? "—"}\n` +
-            `Technologies: ${probe.technologies.join(", ") || "none detected"}`,
-          metadata: {
-            url: probe.finalUrl, status: probe.status, title: probe.title,
-            server: probe.server, technologies: probe.technologies,
-          },
-        }));
-      } else {
-        for (const change of svc.changes) {
-          const alertType =
-            change.field === "http_title" ? "service_title_changed" :
-            change.field === "http_status" ? "service_status_changed" :
-            "service_header_changed";
-          const fieldLabel =
-            change.field === "http_title" ? "Page title" :
-            change.field === "http_status" ? "HTTP status" :
-            change.field === "server_header" ? "Server header" :
-            change.field === "banner" ? "Service banner" :
-            change.field;
-          alerts.push(buildAlert(alertType, targetId, {
-            asset_id: urlAsset.id,
-            asset_value: probe.finalUrl,
-            title: `${fieldLabel} changed on ${a.normalized}`,
-            summary:
-              `The ${fieldLabel.toLowerCase()} for an in-scope HTTP service changed.\n\n` +
-              `URL: ${probe.finalUrl}\nField: ${fieldLabel}\nBefore: ${change.before}\nAfter: ${change.after}\n\n` +
-              `Manual review recommended — this may indicate a deployment or a defacement.`,
-            metadata: {
-              url: probe.finalUrl, field: change.field,
-              before: change.before, after: change.after,
-            },
-          }));
-        }
-      }
-
-      for (const tech of probe.technologies) {
-        const techRes = await upsertTechnology(
-          env.DB, urlAsset.id, tech, null, 0.7, "httpx-worker",
-        );
-        if (techRes.created) {
-          alerts.push(buildAlert("new_technology", targetId, {
-            asset_id: urlAsset.id,
-            asset_value: `${a.normalized} (${tech})`,
-            title: `New technology detected on ${a.normalized}: ${tech}`,
-            summary:
-              `A new technology was fingerprinted on an in-scope asset.\n\n` +
-              `URL: ${probe.finalUrl}\nTechnology: ${tech}\nConfidence: 0.70`,
-            metadata: { url: probe.finalUrl, technology: tech },
-          }));
-        }
-      }
-
-      const jsResult = await analyzeJsForAsset(
-        env, targetId, a.id, `https://${a.normalized}/`, scope,
-        env.REDACTION_SALT ?? "fallback-redaction-salt",
-      );
-      alerts.push(...jsResult.alerts);
+    if (inlineSent < INLINE_ALERT_LIMIT && (alert.severity === "high" || alert.severity === "critical")) {
+      inlineSent++;
+      await sendMessage(env, chatId, inlineAlertMessage(alert), { parseMode: "HTML" });
     }
-
-    // Scans are enqueued by the cron handler or by a /scan command — keep the
-    // audit actor in sync with whatever created the job.
-    const triggeredBy = (job.payload["triggered_by"] as string | null) ?? "cron";
-    const actorKind: AuditActorKind =
-      triggeredBy === "telegram" ? "telegram" : triggeredBy === "api" ? "api" : "system";
-
-    await audit.log({
-      timestamp: new Date().toISOString(),
-      user_id: triggeredByUserId,
-      telegram_id: null,
-      actor_kind: actorKind,
-      organization_id: target.organization_id,
-      action: "scan.completed",
-      target_id: targetId,
-      scope_id: null,
-      job_id: job.id,
-      scanner: "watchtower-discovery",
-      args_redacted: JSON.stringify({ profile: job.payload["profile"] ?? "passive-only", host, alerts: alerts.length }),
-      result: "success",
-      error: null,
-      ip: null,
-      request_id: requestId,
-    });
-
-    return {
-      ok: true,
-      alerts: alerts.length,
-      alertsArray: alerts,
-      organizationId: target.organization_id,
-      targetId,
-      targetName: target.name,
-    };
-  } catch (err) {
-    await audit.log({
-      timestamp: new Date().toISOString(),
-      user_id: triggeredByUserId,
-      telegram_id: null,
-      organization_id: target.organization_id,
-      action: "scan.failed",
-      target_id: targetId,
-      scope_id: null,
-      job_id: job.id,
-      scanner: "watchtower-discovery",
-      args_redacted: "{}",
-      result: "failure",
-      error: String(err),
-      ip: null,
-      request_id: requestId,
-    });
-    return { ok: false, error: String(err), organizationId: target.organization_id, targetId, targetName: target.name };
-  } finally {
-    await lock.release(`scan:${job.id}`);
+    await recordNotificationSent(env.DB, alert, targetId, result.organizationId, `chat:${chatId}`);
   }
+
+  log.info("scan.inline_complete", {
+    targetId, chatId, alerts: result.alerts.length, inlineSent,
+  });
 }
+
+// ---------------------------------------------------------------------------
+// Message formatting (inline /scan path)
+// ---------------------------------------------------------------------------
+
+const INLINE_SEVERITY_EMOJI: Record<string, string> = {
+  critical: "🚨",
+  high: "⚠️",
+  medium: "📋",
+  low: "ℹ️",
+  informational: "📌",
+};
+
+function summaryMessage(result: ScanRunResult): string {
+  const s = result.stats;
+  const lines = [
+    `✅ <b>Initial scan finished — ${escapeHtml(result.targetName)}</b>`,
+    "",
+    `🌐 New subdomains: <b>${s.subdomainsFound}</b>`,
+    `🖥 Live hosts probed: <b>${s.liveHosts}</b> / ${s.hostsProbed}`,
+    `🔌 Ports: <b>${s.portsOpen}</b> open / ${s.portsProbed} probed this pass`,
+    `🧬 New technologies: <b>${s.newTechs}</b>`,
+    `🛡 CVE matches: <b>${s.cvesFound}</b>`,
+    `🔑 Secret candidates: <b>${s.secretsFound}</b>`,
+    `🧪 Fuzz findings: <b>${s.fuzzFindings}</b> (${s.fuzzRequests} requests)`,
+  ];
+
+  if (s.bruteforce) {
+    lines.push(
+      `🔁 Subdomain bruteforce: ${s.bruteforce.cursor}/${s.bruteforce.total}` +
+      ` entries${s.bruteforce.done ? " (cycle complete)" : ""}`,
+    );
+    if (s.wildcardSkipped > 0) {
+      lines.push(`🃏 Wildcard-DNS false positives filtered: <b>${s.wildcardSkipped}</b>`);
+    }
+  }
+
+  if (s.topSubdomains.length > 0) {
+    lines.push("", "<b>🆕 New subdomains</b>");
+    for (const host of s.topSubdomains) lines.push(`• <code>${escapeHtml(host)}</code>`);
+  }
+
+  if (s.deadlineReached) {
+    lines.push("", "<i>Time budget reached — probes, JavaScript and fuzzing continue on the next tick.</i>");
+  }
+
+  lines.push(
+    "",
+    "<i>Continuous monitoring is on. From now on you only get messages for NEW findings.</i>",
+  );
+  return lines.join("\n");
+}
+
+function inlineAlertMessage(alert: Alert): string {
+  const emoji = INLINE_SEVERITY_EMOJI[alert.severity] ?? "📌";
+  return (
+    `${emoji} <b>[${alert.severity.toUpperCase()}] ${escapeHtml(alert.title)}</b>\n\n` +
+    escapeHtml(alert.summary)
+  );
+}
+
+
+async function enqueueAlertNotifications(env: Env, result: ScanRunResult): Promise<number> {
+  let enqueued = 0;
+  for (const alert of result.alerts) {
+    await enqueueJob(env.DB, "notification", {
+      organization_id: result.organizationId,
+      target_id: result.targetId,
+      finding_id: (alert.metadata["finding_id"] as string | undefined) ?? null,
+      channel: "telegram",
+      severity: alert.severity,
+      payload: {
+        title: alert.title,
+        summary: alert.summary,
+        change_type: alert.type,
+        target_id: result.targetId,
+        target_name: result.targetName,
+        ...alert.metadata,
+      },
+      dedup_key: alert.dedup_key,
+    }, { dedup_key: alert.dedup_key });
+    enqueued++;
+  }
+  return enqueued;
+}
+
+
+
+
+
+

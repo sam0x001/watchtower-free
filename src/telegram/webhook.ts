@@ -1,14 +1,16 @@
 // src/telegram/webhook.ts
-// Telegram webhook ingress — validates the secret token, parses the update,
-// dispatches to the command router, and acks Telegram quickly.
+// Telegram webhook ingress — validates the secret token, checks the user
+// allowlist (AUTHORIZED_TELEGRAM_IDS env seed + allowed_users table), and
+// dispatches to the command router.
+//
+// Anyone not on the allowlist gets a single "unauthorized" reply — exactly
+// like the previous behaviour, minus the audit-log ceremony.
 
 import type { Env } from "../env.js";
-import type { ConsoleLogger } from "../audit/logger.js";
-import { verifyWebhookSignature } from "../crypto/hmac.js";
 import { COMMANDS } from "../constants.js";
 import { handleCommand } from "./commands.js";
-import { newRequestId } from "../audit/logger.js";
-import { D1AuditLogger } from "../audit/logger.js";
+import { newRequestId, log } from "../lib/console-logger.js";
+import { listAllowedUsers } from "../db/queries/targets.js";
 
 const TELEGRAM_API = "https://api.telegram.org";
 
@@ -21,26 +23,34 @@ export interface TelegramUpdate {
     text?: string;
     date: number;
   };
-  callback_query?: {
-    id: string;
-    from: { id: number; is_bot: boolean; first_name?: string; username?: string };
-    message: { message_id: number; chat: { id: number; type: string } };
-    data: string;
-  };
+}
+
+/** The effective allowlist: env seed + users added via /allow. */
+export async function resolveAllowlist(env: Env): Promise<string[]> {
+  const envIds = (env.AUTHORIZED_TELEGRAM_IDS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  try {
+    const dbIds = await listAllowedUsers(env.DB);
+    return Array.from(new Set([...envIds, ...dbIds]));
+  } catch {
+    // D1 unavailable — fall back to the env allowlist only.
+    return envIds;
+  }
 }
 
 export async function handleTelegramWebhook(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
-  log: ConsoleLogger,
 ): Promise<Response> {
   const url = new URL(request.url);
   const secretParam = url.searchParams.get("secret");
   const xTelegramBot = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
 
   // Verify the secret. Telegram sends X-Telegram-Bot-Api-Secret-Token header.
-  // We additionally accept a ?secret= path param for router-style configuration.
+  // We additionally accept a ?secret= param for router-style configuration.
   if (env.TELEGRAM_WEBHOOK_SECRET) {
     if (secretParam !== env.TELEGRAM_WEBHOOK_SECRET && xTelegramBot !== env.TELEGRAM_WEBHOOK_SECRET) {
       return new Response("Unauthorized", { status: 401 });
@@ -54,129 +64,45 @@ export async function handleTelegramWebhook(
     return new Response("Bad Request", { status: 400 });
   }
 
-  // Ack immediately — long work is moved to waitUntil and/or queues.
-  ctx.waitUntil(processUpdate(update, env, request, log));
-
-  // Register the command list on first webhook call (best-effort, idempotent)
+  // Ack immediately — long work runs in waitUntil.
+  ctx.waitUntil(processUpdate(update, env));
   return new Response("ok", { status: 200 });
 }
 
-async function processUpdate(
-  update: TelegramUpdate,
-  env: Env,
-  request: Request,
-  log: ConsoleLogger,
-): Promise<void> {
+async function processUpdate(update: TelegramUpdate, env: Env): Promise<void> {
   const requestId = newRequestId();
-  const audit = new D1AuditLogger(env.DB);
   try {
-    if (update.message?.text) {
-      const chatId = update.message.chat.id;
-      const user = update.message.from;
-      const text = update.message.text.trim();
-      const allowedIds = (env.AUTHORIZED_TELEGRAM_IDS ?? "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const isBootstrap = allowedIds.length > 0 && user ? allowedIds.includes(String(user.id)) : false;
+    if (!update.message?.text) return;
+    const chatId = update.message.chat.id;
+    const user = update.message.from;
+    const text = update.message.text.trim();
 
-      // `/start` is always allowed so a brand-new admin can bootstrap
-      if (!text.startsWith("/start") && !isBootstrap) {
-        await sendMessage(env, chatId, "⛔ Unauthorized. Contact your Watchtower administrator.");
-        await audit.log({
-          timestamp: new Date().toISOString(),
-          user_id: null,
-          telegram_id: user ? String(user.id) : null,
-          actor_kind: "telegram",
-          organization_id: null,
-          action: "telegram.command.unauthorized",
-          target_id: null,
-          scope_id: null,
-          job_id: null,
-          scanner: null,
-          args_redacted: JSON.stringify({ command: text }),
-          result: "denied",
-          error: "User not in AUTHORIZED_TELEGRAM_IDS",
-          ip: request.headers.get("cf-connecting-ip"),
-          request_id: requestId,
-        });
-        return;
-      }
-      await handleCommand(env, {
-        text,
-        chatId,
-        user: user ? { id: user.id, first_name: user.first_name, username: user.username } : null,
-        requestId,
-        audit,
-        log,
-      });
-    } else if (update.callback_query) {
-      const cq = update.callback_query;
-      await handleCallback(env, cq, requestId, audit, log);
+    const allowed = await resolveAllowlist(env);
+
+    // /start is always answered (a brand-new admin needs to see their ID).
+    if (!text.startsWith("/start") && !allowed.includes(String(user?.id ?? ""))) {
+      await sendMessage(env, chatId, "⛔ Unauthorized. Contact your Watchtower administrator.");
+      return;
     }
+
+    await handleCommand(env, {
+      text,
+      chatId,
+      user: user && !user.is_bot ? { id: user.id, first_name: user.first_name, username: user.username } : null,
+      requestId,
+      allowlist: allowed,
+    });
   } catch (err) {
     log.error("telegram.process_update.failed", { err: String(err), requestId });
-    await audit.log({
-      timestamp: new Date().toISOString(),
-      user_id: null,
-      telegram_id: update.message?.from ? String(update.message.from.id) : null,
-      actor_kind: "telegram",
-      organization_id: null,
-      action: "telegram.process_update",
-      target_id: null,
-      scope_id: null,
-      job_id: null,
-      scanner: null,
-      args_redacted: JSON.stringify({ update_id: update.update_id }),
-      result: "failure",
-      error: String(err),
-      ip: request.headers.get("cf-connecting-ip"),
-      request_id: requestId,
-    });
   }
 }
 
-async function handleCallback(
+export async function sendMessage(
   env: Env,
-  cq: NonNullable<TelegramUpdate["callback_query"]>,
-  requestId: string,
-  audit: D1AuditLogger,
-  log: ConsoleLogger,
+  chatId: number,
+  text: string,
+  opts: { parseMode?: "MarkdownV2" | "HTML"; replyMarkup?: unknown } = {},
 ): Promise<void> {
-  // Callback format: "finding:verify:FND-1234" etc.
-  const data = cq.data;
-  const [kind, action, id] = data.split(":", 3);
-  await audit.log({
-    timestamp: new Date().toISOString(),
-    user_id: null,
-    telegram_id: String(cq.from.id),
-    actor_kind: "telegram",
-    organization_id: null,
-    action: `telegram.callback.${kind}.${action}`,
-    target_id: null,
-    scope_id: null,
-    job_id: null,
-    scanner: null,
-    args_redacted: JSON.stringify({ id }),
-    result: "success",
-    error: null,
-    ip: null,
-    request_id: requestId,
-  });
-
-  // Answer the callback to remove the spinner
-  await fetch(`${TELEGRAM_API}/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ callback_query_id: cq.id }),
-  });
-
-  if (kind === "finding") {
-    await sendMessage(env, cq.message.chat.id, `✅ Received ${action} for finding ${id}. Use the API or run /finding_${action} to complete.`);
-  }
-}
-
-export async function sendMessage(env: Env, chatId: number, text: string, opts: { parseMode?: "MarkdownV2" | "HTML"; replyMarkup?: unknown } = {}): Promise<void> {
   if (text.length > 4096) text = text.slice(0, 4090) + "\n...";
   await fetch(`${TELEGRAM_API}/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
@@ -197,7 +123,7 @@ export async function setWebhook(env: Env, publicUrl: string): Promise<void> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       url: `${publicUrl}/telegram?secret=${env.TELEGRAM_WEBHOOK_SECRET}`,
-      allowed_updates: ["message", "callback_query"],
+      allowed_updates: ["message"],
       secret_token: env.TELEGRAM_WEBHOOK_SECRET,
     }),
   });

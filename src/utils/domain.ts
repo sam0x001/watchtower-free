@@ -31,6 +31,8 @@ export function normalizeDomain(input: string): string | null {
   if (v.startsWith("-") || v.endsWith("-")) return null;
   if (v.startsWith(".") || v.endsWith(".")) return null;
   if (v.includes("..")) return null;
+  // No individual label may start or end with a hyphen (RFC 1123 hostnames).
+  if (v.split(".").some((label) => label.startsWith("-") || label.endsWith("-"))) return null;
   if (v.length > 253) return null;
   return v;
 }

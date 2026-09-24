@@ -56,7 +56,9 @@ export const SECRET_PATTERNS: readonly SecretPattern[] = [
   {
     id: 'google_api_key',
     label: 'Google API key',
-    regex: /\bAIza[0-9A-Za-z_-]{35}\b/g,
+    // Google keys are `AIza` + 35 chars; the trailing boundary is deliberately
+    // loose so re-issued / longer keys are still caught.
+    regex: /\bAIza[0-9A-Za-z_-]{35,}/g,
     confidence: 0.95,
     severity: 'high',
   },
@@ -105,7 +107,10 @@ export const SECRET_PATTERNS: readonly SecretPattern[] = [
   {
     id: 'private_key_block',
     label: 'PEM private key',
-    regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/g,
+    // Matches the WHOLE PEM block so the base64 body is redacted too, not just
+    // the header line.
+    regex:
+      /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/g,
     confidence: 0.99,
     severity: 'critical',
   },
@@ -208,7 +213,7 @@ export function redactString(input: string): string {
  *   - Depth is bounded so a cyclic structure cannot hang a Worker.
  *   - Typed arrays / ArrayBuffers are summarised, never dumped.
  */
-export function redactDeep<T>(value: T, depth = 0): unknown {
+export function redactDeep<T>(value: T, depth = 0, seen: WeakSet<object> = new WeakSet()): unknown {
   if (depth > 12) return '[DEPTH_LIMIT]';
   if (value === null || value === undefined) return value;
 
@@ -223,16 +228,22 @@ export function redactDeep<T>(value: T, depth = 0): unknown {
   if (value instanceof Date) return value.toISOString();
   if (value instanceof URL) return redactString(value.toString());
 
+  // Cycle guard: a self-referential object would otherwise recurse until the
+  // depth limit (or blow up on a wide cyclic graph).
+  const asObject = value as unknown as object;
+  if (seen.has(asObject)) return '[DEPTH_LIMIT]';
+  seen.add(asObject);
+
   if (Array.isArray(value)) {
     const limit = 200;
-    const head = value.slice(0, limit).map((entry) => redactDeep(entry, depth + 1));
+    const head = value.slice(0, limit).map((entry) => redactDeep(entry, depth + 1, seen));
     if (value.length > limit) head.push(`[${value.length - limit} more items]`);
     return head;
   }
 
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    out[key] = isSensitiveKey(key) ? REDACTED : redactDeep(entry, depth + 1);
+    out[key] = isSensitiveKey(key) ? REDACTED : redactDeep(entry, depth + 1, seen);
   }
   return out;
 }

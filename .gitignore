@@ -13,10 +13,3 @@ coverage/
 *.zip
 .freebuff
 watchtower-*.tgz
-
-d1-err.txt
-d1-out.txt
-jq-err.txt
-jq-out.txt
-tmp-check-jobs.sql
-tmp-fix2.cjs

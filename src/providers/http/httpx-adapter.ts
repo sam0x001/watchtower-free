@@ -1,13 +1,22 @@
 // src/providers/http/httpx-adapter.ts
-// Safe HTTP discovery adapter — uses the Worker's own fetch (already SSRF-guarded
-// upstream) to probe a host for HTTP metadata. Does NOT execute JavaScript, does
-// NOT submit forms, does NOT follow cross-scope redirects.
+// Safe HTTP discovery adapter — probes a host for HTTP metadata. Does NOT
+// execute JavaScript, does NOT submit forms, does NOT follow cross-scope
+// redirects.
+//
+// Fingerprinting extracts names AND versions where available (Server header,
+// X-Powered-By, generator meta tags) — versions feed the OSV CVE matcher.
 
-import type { ProviderContext, ProviderResult, ReconProvider, ProviderAsset } from "../types.js";
+import type { ProviderContext, ProviderResult, ReconProvider } from "../types.js";
 import { LIMITS } from "../../constants.js";
 import { validateRedirect } from "../../security/redirect.js";
 import type { CompiledScope } from "../../security/scope.js";
 import { checkUrlInScope } from "../../security/scope.js";
+
+/** A fingerprinted technology: name plus version when extractable. */
+export interface TechHit {
+  name: string;
+  version: string | null;
+}
 
 export interface HttpProbeResult {
   url: string;
@@ -19,7 +28,7 @@ export interface HttpProbeResult {
   contentLength: number;
   redirects: string[];
   securityHeaders: Record<string, string | null>;
-  technologies: string[];
+  technologies: TechHit[];
   bodyHash: string;
 }
 
@@ -138,25 +147,63 @@ function extractTitle(body: Uint8Array): string | null {
   return m[1].trim().slice(0, 200);
 }
 
-function fingerprintTechnologies(headers: Headers, body: Uint8Array): string[] {
-  const out: string[] = [];
-  const server = (headers.get("server") ?? "").toLowerCase();
-  const powered = (headers.get("x-powered-by") ?? "").toLowerCase();
-  if (server.includes("nginx")) out.push("nginx");
-  if (server.includes("apache")) out.push("apache");
-  if (server.includes("cloudflare")) out.push("cloudflare");
-  if (server.includes("gunicorn")) out.push("gunicorn");
-  if (powered.includes("express")) out.push("express");
-  if (powered.includes("php")) out.push("php");
-  if (powered.includes("asp.net")) out.push("asp.net");
+const VERSION_IN_HEADER = /([a-z][a-z0-9._+-]*)\s*[/v]\s*(\d+(?:\.\d+)+(?:[-+][\w.]+)?)/i;
+const SEMVER = /^\d+(?:\.\d+)+(?:[-+][\w.]+)?$/;
+
+/** Pull a "name/version" pair out of a header value like "nginx/1.18.0". */
+function fromHeader(value: string, fallbackName: string | null): TechHit | null {
+  const m = value.match(VERSION_IN_HEADER);
+  if (m && SEMVER.test(m[2]!)) {
+    return { name: m[1]!.toLowerCase(), version: m[2]! };
+  }
+  if (fallbackName) return { name: fallbackName, version: null };
+  return null;
+}
+
+export function fingerprintTechnologies(headers: Headers, body: Uint8Array): TechHit[] {
+  const out = new Map<string, TechHit>();
+  const add = (hit: TechHit | null) => {
+    if (!hit) return;
+    const key = hit.name;
+    const prev = out.get(key);
+    // Prefer the entry with a version.
+    if (!prev || (prev.version === null && hit.version)) out.set(key, hit);
+  };
+
+  const server = (headers.get("server") ?? "");
+  const serverLc = server.toLowerCase();
+  const powered = (headers.get("x-powered-by") ?? "");
+  const poweredLc = powered.toLowerCase();
+
+  if (serverLc.includes("nginx")) add(fromHeader(server, "nginx"));
+  if (serverLc.includes("apache")) add(fromHeader(server, "apache"));
+  if (serverLc.includes("cloudflare")) add({ name: "cloudflare", version: null });
+  if (serverLc.includes("gunicorn")) add({ name: "gunicorn", version: null });
+  if (serverLc.includes("microsoft-iis")) add(fromHeader(server, "iis"));
+  if (poweredLc.includes("php")) add(fromHeader(powered, "php"));
+  if (poweredLc.includes("express")) add(fromHeader(powered, "express"));
+  if (poweredLc.includes("asp.net")) add(fromHeader(powered, "asp.net"));
+  if (poweredLc.includes("servlet")) add(fromHeader(powered, null));
+
   const text = new TextDecoder().decode(body.subarray(0, Math.min(body.byteLength, 200_000)));
-  if (/window\.__NUXT__/.test(text)) out.push("nuxt");
-  if (/window\.__NEXT_DATA__/.test(text)) out.push("next.js");
-  if (/window\.__INITIAL_STATE__/.test(text) && /vue/.test(text.toLowerCase())) out.push("vue");
-  if (/react/i.test(text) && /data-reactroot/.test(text)) out.push("react");
-  if (/wp-content\//.test(text)) out.push("wordpress");
-  if (/cdn\.jsdelivr\.net/.test(text)) out.push("jsdelivr");
-  return Array.from(new Set(out));
+  const generator = text.match(/<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)["']/i)?.[1] ?? "";
+  if (/wordpress/i.test(generator)) {
+    const v = generator.match(/(\d+(?:\.\d+)+)/)?.[1] ?? null;
+    add({ name: "wordpress", version: v });
+  } else if (/wp-content\//.test(text)) {
+    add({ name: "wordpress", version: null });
+  }
+  if (/window\.__NUXT__/.test(text)) add({ name: "nuxt", version: null });
+  if (/window\.__NEXT_DATA__/.test(text)) add({ name: "next.js", version: null });
+  if (/window\.__INITIAL_STATE__/.test(text) && /vue/.test(text.toLowerCase())) add({ name: "vue", version: null });
+  if (/react/i.test(text) && /data-reactroot/.test(text)) add({ name: "react", version: null });
+  if (/drupal/i.test(generator)) {
+    const v = generator.match(/(\d+(?:\.\d+)+)/)?.[1] ?? null;
+    add({ name: "drupal", version: v });
+  }
+  if (/joomla/i.test(generator)) add({ name: "joomla", version: null });
+
+  return Array.from(out.values());
 }
 
 async function hashSha256(bytes: Uint8Array): Promise<string> {

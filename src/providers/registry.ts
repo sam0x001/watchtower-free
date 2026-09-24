@@ -7,14 +7,11 @@ import { CertSpotterProvider } from "./ct/certspotter.js";
 import { CrtndstryProvider } from "./ct/crtndstry.js";
 import { DohProvider } from "./dns/doh.js";
 import { HttpxProvider } from "./http/httpx-adapter.js";
-import { OsvProvider } from "./cve/osv.js";
 
 export interface ProviderRegistry {
   ct: ReconProvider[];
   dns: ReconProvider[];
   http: ReconProvider[];
-  cve: ReconProvider[];
-  scanners: string[];
   all: ReconProvider[];
 }
 
@@ -22,9 +19,7 @@ export function buildRegistry(): ProviderRegistry {
   const ct = [new CrtShProvider(), new CertSpotterProvider(), new CrtndstryProvider()];
   const dns = [new DohProvider()];
   const http = [new HttpxProvider()];
-  const cve = [new OsvProvider()];
-  const scanners = ["nmap", "subfinder", "amass", "httpx", "nuclei", "zap", "burp"];
-  return { ct, dns, http, cve, scanners, all: [...ct, ...dns, ...http, ...cve] };
+  return { ct, dns, http, all: [...ct, ...dns, ...http] };
 }
 
 export async function runProviders(

@@ -12,6 +12,7 @@ import type { CompiledScope } from "../security/scope.js";
 import { checkUrlInScope } from "../security/scope.js";
 import { safeFetch } from "../security/ssrf.js";
 import { upsertJavascriptFile, insertApiEndpoint } from "../db/queries/assets.js";
+import { insertFinding } from "../db/queries/findings.js";
 import { sha256 } from "../crypto/hash.js";
 import { redactWithFingerprints } from "../security/redaction.js";
 import { LIMITS } from "../constants.js";
@@ -136,29 +137,27 @@ export async function analyzeJsForAsset(
         }
       }
 
-      // Secret detection — values are NEVER stored. Only fingerprints.
+      // Secret detection — values are NEVER stored. Only salted fingerprints.
       const { secrets } = await redactWithFingerprints(bodyText, redactionSalt);
       out.secretsDetected += secrets.length;
       for (const s of secrets) {
-        const findingId = `FND_${crypto.randomUUID()}`;
-        await env.DB
-          .prepare(`INSERT INTO findings (
-            id, finding_ref, organization_id, target_id, asset_id,
-            finding_type, title, summary, technical_detail,
-            severity, detection_source, detection_method,
-            confidence, status, verification_state, scope_validation,
-            affected_asset,
-            first_seen, last_seen, created_at, updated_at
-          ) VALUES (?, ?, (SELECT organization_id FROM targets WHERE id = ?), ?, ?, 'exposed_secret_candidate', ?, ?, '', 'high', 'js-analysis', 'regex-detection', ?, 'open', 'detected', 'pending', ?, ?, ?, ?, ?)`)
-          .bind(
-            findingId, findingId, targetId, targetId, assetId,
-            `Possible ${s.type} detected in JavaScript`,
-            `A high-confidence ${s.type} pattern was detected at line ${s.line} of ${jsUrl}. Value has been redacted; fingerprint stored. Manual review required.`,
-            s.confidence,
-            jsUrl,
-            new Date().toISOString(), new Date().toISOString(), new Date().toISOString(), new Date().toISOString(),
-          )
-          .run();
+        const fingerprint = await sha256(`secret|${jsUrl}|${s.type}|${s.fingerprint}`);
+        const findingId = await insertFinding(env.DB, {
+          targetId,
+          assetId,
+          findingType: "exposed_secret_candidate",
+          title: `Possible ${s.type} detected in JavaScript`,
+          summary: `A high-confidence ${s.type} pattern was detected at line ${s.line} of ${jsUrl}. Value has been redacted; fingerprint stored. Manual review required.`,
+          severity: "high",
+          affectedAsset: jsUrl,
+          affectedUrl: jsUrl,
+          detectionSource: "js-analysis",
+          detectionMethod: "regex-detection",
+          confidence: s.confidence,
+          fingerprint,
+          metadata: { js_url: jsUrl, line: s.line, secret_type: s.type, value_fingerprint: s.fingerprint },
+        });
+        if (!findingId) continue; // already known — don't re-alert
         out.redactedSecretsStored++;
 
         alerts.push(buildAlert("new_secret_candidate", targetId, {
