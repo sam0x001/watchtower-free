@@ -2,7 +2,7 @@
 -- Watchtower migration 0006 - target groups (categories)
 --
 -- A group is a named bucket of domains scanned under one id, e.g.
--- /target-add shop → shop.example.com + api.example.com report as "shop".
+-- /target_add shop → shop.example.com + api.example.com report as "shop".
 -- targets.group_id is nullable so pre-existing targets simply have no group.
 -- Deleting a group detaches its members (they keep monitoring); use /remove
 -- to delete domains.
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS target_groups (
 );
 
 -- Category names are case-insensitive (matches the NOCASE lookup in
--- getTargetGroupByNameOrId): `/target-add shop` and `/target-add SHOP`
+-- getTargetGroupByNameOrId): `/target_add shop` and `/target_add SHOP`
 -- are the same category, not two.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_target_groups_name
   ON target_groups (name COLLATE NOCASE);

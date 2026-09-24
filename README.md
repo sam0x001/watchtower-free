@@ -36,15 +36,15 @@ Four capabilities, nothing else:
 ## How it works
 
 ```
-/target-add shop           ← group your program's domains (optional)
+/target_add shop           ← group your program's domains (optional)
 /add shop.example.com shop ← filing a domain under the category
-/target-info shop          ← every domain added for this category
+/target_info shop          ← every domain added for this category
 /scan shop.example.com     ← first results land in chat within seconds
 every 5 minutes forever    ← only NEW findings are reported from now on
 ```
 
 - Categories are an **organizational layer only**: they group domains under
-  one id so `/target-info` can show them together. Scanning, exclusions and
+  one id so `/target_info` can show them together. Scanning, exclusions and
   feature toggles all operate on the **domain** — never the category.
 - `/add example.com` implies `*.example.com` — **every** subdomain is in scope.
   There is no scope declaration step. The category argument is optional;
@@ -67,8 +67,8 @@ every 5 minutes forever    ← only NEW findings are reported from now on
 |---|---|
 | `/start` | Welcome screen (also answers before you are allowlisted, so you can see your Telegram ID) |
 | `/help` | This list, in chat |
-| `/target-add <name>` | Create a target category, e.g. `/target-add shop` |
-| `/target-info <name\|id>` | Every domain added under that category, with last scan / exclusions / feature count |
+| `/target_add <name>` | Create a target category, e.g. `/target_add shop` |
+| `/target_info <name\|id>` | Every domain added under that category, with last scan / exclusions / feature count |
 | `/add <domain> [category]` | Start monitoring. Every subdomain is in scope immediately; optional 2nd arg files it under a category |
 | `/remove <domain>` | Stop monitoring and delete everything stored for the target |
 | `/list` | Categories with their domains, then standalone domains — plus asset counts, last scan and exclusions |

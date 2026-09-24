@@ -1,6 +1,6 @@
 // test/target-groups.test.ts
-// Target categories: /target-add creates a bucket, /add <domain> <category>
-// assigns membership, /target-info lists members, and feature toggles stay
+// Target categories: /target_add creates a bucket, /add <domain> <category>
+// assigns membership, /target_info lists members, and feature toggles stay
 // strictly per domain.
 
 import { describe, it, expect } from "vitest";

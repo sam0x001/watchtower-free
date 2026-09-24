@@ -9,17 +9,17 @@ export const messages = {
     `Every new finding lands in this chat.\n\n` +
     (telegramId ? `Your Telegram ID: <code>${telegramId}</code>\n` : "") +
     `<b>Quick start</b>\n` +
-    `<code>/target-add shop</code>\n` +
+    `<code>/target_add shop</code>\n` +
     `<code>/add shop.example.com shop</code>\n` +
-    `<code>/target-info shop</code>\n` +
+    `<code>/target_info shop</code>\n` +
     `<code>/scan shop.example.com</code>\n` +
     `<code>/feature shop.example.com</code>`,
 
   help: () =>
     `<b>Watchtower Commands</b>\n\n` +
     `<b>Targets</b>\n` +
-    `/target-add &lt;name&gt; — create a target category (e.g. /target-add shop)\n` +
-    `/target-info &lt;name|id&gt; — list every domain added under that category\n` +
+    `/target_add &lt;name&gt; — create a target category (e.g. /target_add shop)\n` +
+    `/target_info &lt;name|id&gt; — list every domain added under that category\n` +
     `/add &lt;domain&gt; [category] — start monitoring (wildcards implied: every subdomain is in scope)\n` +
     `/remove &lt;domain&gt; — stop monitoring\n` +
     `/list — categories, domains, exclusions, asset counts\n\n` +

@@ -1,11 +1,13 @@
 // src/telegram/commands.ts
 // Command router — the entire bot surface:
-//   /start /help /target-add /target-info /add /remove /list /exclude
+//   /start /help /target_add /target_info /add /remove /list /exclude
 //   /scan /feature /allow /disallow
 //
-// Note on names: Telegram command menus only allow [a-zA-Z0-9_], but
-// parseCommand normalizes "-" to "_", so `/target-add` and `/target_add`
-// both work when typed; the menu registers the underscore form.
+// Note on names: Telegram command menus only allow [a-zA-Z0-9_] — a "-"
+// breaks setMyCommands, so underscore is the canonical spelling everywhere
+// the bot shows a command. parseCommand still folds "-" to "_", so anyone
+// who types the hyphenated form from an old message still lands on the
+// right handler.
 
 import type { Env } from "../env.js";
 import { sendMessage } from "./webhook.js";
@@ -124,8 +126,8 @@ const handlers: Record<string, CommandHandler> = {
   target_add: async (env, ctx, args) => {
     if (args.length < 1) {
       await sendMessage(env, ctx.chatId,
-        "Usage: /target-add <category_name>\n" +
-        "Example: /target-add shop\n" +
+        "Usage: /target_add <category_name>\n" +
+        "Example: /target_add shop\n" +
         "Then add domains to it: /add shop.example.com shop");
       return;
     }
@@ -139,7 +141,7 @@ const handlers: Record<string, CommandHandler> = {
     if (existing) {
       await sendMessage(env, ctx.chatId,
         `⚠️ Category <b>${escapeHtml(existing.name)}</b> already exists (${escapeHtml(existing.id)}).\n` +
-        `Show it with <code>/target-info ${escapeHtml(existing.id)}</code>.`,
+        `Show it with <code>/target_info ${escapeHtml(existing.id)}</code>.`,
         { parseMode: "HTML" });
       return;
     }
@@ -149,21 +151,21 @@ const handlers: Record<string, CommandHandler> = {
       `Add its domains:\n` +
       `<code>/add example.com ${escapeHtml(group.id)}</code>\n` +
       `<code>/add api.example.com ${escapeHtml(group.id)}</code>\n\n` +
-      `Inspect it any time with <code>/target-info ${escapeHtml(group.id)}</code>`,
+      `Inspect it any time with <code>/target_info ${escapeHtml(group.id)}</code>`,
       { parseMode: "HTML" });
   },
 
   target_info: async (env, ctx, args) => {
     if (args.length < 1) {
       await sendMessage(env, ctx.chatId,
-        "Usage: /target-info <category_name_or_id>\n" +
+        "Usage: /target_info <category_name_or_id>\n" +
         "Use /list to see all categories.");
       return;
     }
     const group = await getTargetGroupByNameOrId(env.DB, args[0]!);
     if (!group) {
       await sendMessage(env, ctx.chatId,
-        `Category ${args[0]} not found. Create it with /target-add ${args[0]} or list them with /list.`);
+        `Category ${args[0]} not found. Create it with /target_add ${args[0]} or list them with /list.`);
       return;
     }
 
@@ -205,7 +207,7 @@ const handlers: Record<string, CommandHandler> = {
       await sendMessage(env, ctx.chatId,
         "Usage: /add <domain> [category]\n" +
         "Example: /add shop.example.com shop\n" +
-        "Create the category first with /target-add shop (or omit it for a standalone domain).");
+        "Create the category first with /target_add shop (or omit it for a standalone domain).");
       return;
     }
     // Optional second arg = category (name or id) the domain belongs to.
@@ -214,7 +216,7 @@ const handlers: Record<string, CommandHandler> = {
       const g = await getTargetGroupByNameOrId(env.DB, args[1]);
       if (!g) {
         await sendMessage(env, ctx.chatId,
-          `Category ${escapeHtml(args[1])} not found. Create it first with /target-add ${escapeHtml(args[1])}, ` +
+          `Category ${escapeHtml(args[1])} not found. Create it first with /target_add ${escapeHtml(args[1])}, ` +
           `or omit the category to add a standalone domain.`,
           { parseMode: "HTML" });
         return;
@@ -250,7 +252,7 @@ const handlers: Record<string, CommandHandler> = {
       `✅ Added <code>${escapeHtml(domain)}</code>${where} (id <code>${escapeHtml(target.id)}</code>).\n` +
       `Every subdomain is in scope.\n` +
       `Next: <code>/scan ${escapeHtml(domain)}</code>` +
-      (group ? ` · <code>/target-info ${escapeHtml(group.id)}</code>` : ""),
+      (group ? ` · <code>/target_info ${escapeHtml(group.id)}</code>` : ""),
       { parseMode: "HTML" });
   },
 
@@ -268,7 +270,7 @@ const handlers: Record<string, CommandHandler> = {
     if (targets.length === 0 && groups.length === 0) {
       await sendMessage(env, ctx.chatId,
         "No targets yet. Add one with /add example.com\n" +
-        "Or create a category first: /target-add shop\n" +
+        "Or create a category first: /target_add shop\n" +
         "Then add its domains: /add shop.example.com shop");
       return;
     }
@@ -287,7 +289,7 @@ const handlers: Record<string, CommandHandler> = {
           ` — <code>/feature ${escapeHtml(m.name)}</code>`,
         );
       }
-      lines.push(`  <i>details: /target-info ${escapeHtml(g.id)}</i>`, "");
+      lines.push(`  <i>details: /target_info ${escapeHtml(g.id)}</i>`, "");
     }
 
     const standalone = targets.filter((t) => !t.group_id);

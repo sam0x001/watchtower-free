@@ -114,7 +114,7 @@ export async function deleteTarget(db: D1Database, targetId: string): Promise<vo
 // Target groups (categories) — migrations/0006_target_groups.sql
 // ---------------------------------------------------------------------------
 
-/** Create a named bucket of domains, e.g. /target-add shop. */
+/** Create a named bucket of domains, e.g. /target_add shop. */
 export async function createTargetGroup(
   db: D1Database,
   name: string,

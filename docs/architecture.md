@@ -105,7 +105,7 @@ removal — only successful responses update the baseline.
 `0002_assets` assets / dns / certs / services / technologies / js / api ·
 `0003_scans_findings` scans / job_queue / findings ·
 `0004_notifications` notifications · `0005_target_features` per-domain
-toggles · `0006_target_groups` categories (`/target-add`, `/target-info`).
+toggles · `0006_target_groups` categories (`/target_add`, `/target_info`).
 
 Categories are organizational only: scanning, exclusions and feature toggles
 always resolve to a **domain** row.

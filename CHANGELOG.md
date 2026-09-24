@@ -25,9 +25,9 @@ Breaking change from the 3.x line:
 - Schema incompatible with 3.x: separate migration files (`0001_core` …
   `0006_target_groups`); the deployment guide tells you to recreate the
   D1 database.
-- **Target categories**: `/target-add <name>` creates a category,
+- **Target categories**: `/target_add <name>` creates a category,
   `/add <domain> <category>` files a domain under it, and
-  `/target-info <category>` lists every member with last scan, exclusions and
+  `/target_info <category>` lists every member with last scan, exclusions and
   its feature count. Categories only organize domains — scanning, exclusions
   and **feature toggles stay strictly per domain**. Deleting a category
   detaches (never deletes) its domains.

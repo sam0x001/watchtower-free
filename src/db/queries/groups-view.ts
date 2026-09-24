@@ -1,5 +1,5 @@
 // src/db/queries/groups-view.ts
-// Bulk read helpers for /target-info and /list. One query per concern for the
+// Bulk read helpers for /target_info and /list. One query per concern for the
 // whole group instead of N+1 lookups per member domain.
 
 import { FEATURES, FEATURE_KEYS, type FeatureMap } from "./features.js";

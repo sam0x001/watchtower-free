@@ -105,7 +105,7 @@ export interface Target {
   created_by?: string | null;
 }
 
-/** A named bucket of domains scanned under one id (see /target-add). */
+/** A named bucket of domains scanned under one id (see /target_add). */
 export interface TargetGroup {
   id: string;
   name: string;

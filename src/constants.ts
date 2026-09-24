@@ -66,11 +66,14 @@ export const BLOCKED_HOSTNAMES = new Set([
 export const ALLOWED_PORTS = new Set([80, 443, 8080, 8443, 3000, 5000, 8000, 8888]);
 
 // Telegram command surface — the entire UX of the bot.
+// Command names must be [a-zA-Z0-9_] only: Telegram rejects "-" in
+// setMyCommands, so multi-word commands use "_" (e.g. /target_add). Keep the
+// examples below in that same form — the menu only autocompletes what we print.
 export const COMMANDS = [
   { command: "start",   description: "Initialize the bot and view the welcome screen" },
   { command: "help",    description: "List available commands" },
-  { command: "target_add", description: "Create a target category, e.g. /target-add shop" },
-  { command: "target_info", description: "Show a category and its domains: /target-info <category>" },
+  { command: "target_add", description: "Create a target category, e.g. /target_add shop" },
+  { command: "target_info", description: "Show a category and its domains: /target_info <category>" },
   { command: "add",     description: "Add a domain to monitor: /add <domain> [category]" },
   { command: "exclude", description: "Exclude a subdomain/path from scanning, e.g. /exclude sub.example.com" },
   { command: "scan",    description: "Start an initial scan now, e.g. /scan example.com" },
