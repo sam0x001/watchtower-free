@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+- **`/scan` now hands the heavy phases to the next cron tick.** A manual scan
+  wrote a `scans` row, and that row is what `enqueueDueScans` throttles on — so
+  after a `/scan` the target sat idle until the 30-minute rescan window reopened,
+  contradicting the "continues in the background" message. `/scan` now queues a
+  `continuation` scan at priority 2 (ahead of the priority-1 cron rescan jobs),
+  so probing, JavaScript, CVE matching and fuzzing begin within one tick and
+  notify as they land.
+- **Fixed — `/scan` failed on any target with certificate-transparency data.**
+  `upsertCertificate` omitted `created_at` / `updated_at`, which are
+  `TEXT NOT NULL` with no default in `migrations/0002`. The INSERT failed with
+  `SQLITE_CONSTRAINT_NOTNULL`, and because the CT phase upserts one certificate
+  per asset inside a single `runScanForTarget` call, the throw aborted the whole
+  pass — so `/scan` reported a failed scan and returned nothing at all. The same
+  drift affected `upsertDnsRecord`, `upsertJavascriptFile` and
+  `insertApiEndpoint`, and `upsertService` had a `SELECT` with three
+  placeholders bound with two arguments. All fixed.
+  `test/assets-schema.test.ts` now runs the real upserts against the real
+  migration files on an in-memory SQLite database, so a column/placeholder
+  mismatch fails the build rather than production. It skips on Node 20 (no
+  `node:sqlite`).
+- **Fixed — new subdomains were never delivered.** The inline `/scan` path
+  called `recordNotificationSent()` for every alert but only actually *sent*
+  the high/critical ones. Since `new_subdomain` is `medium` severity, every new
+  subdomain was written into `notifications` as `status='sent'` without ever
+  reaching the chat — and the dispatcher's dedupe then suppressed the same
+  `dedup_key` forever. Alerts now print up to `INLINE_ALERT_LIMIT` (12) into the
+  chat, ranked by severity; anything past the limit is enqueued as a
+  notification job rather than being dropped or falsely baselined.
+- **Fixed — `/scan` could return nothing at all.** The inline pass ran the
+  entire chunked pipeline (300 DoH lookups, JS analysis, 40 fuzz requests per
+  host) inside the webhook invocation, which does not fit the Workers free-tier
+  wall-clock + CPU budget, so the invocation was often killed before the summary
+  was sent. `/scan` now runs the passive phase only (certificate transparency +
+  DNS records — third-party API calls that answer in seconds) and lets the cron
+  own the heavy phases. The "scanning…" acknowledgement is also sent *before*
+  the `scans` row insert, so a failed insert can no longer swallow it.
+- **`/scan <category>`** scans a category name or id and runs the inline
+  discovery pass for the domains filed under it, five per command (bounded so a
+  large category cannot exhaust the free-tier request budget). Send `/scan
+  <category>` again to continue with the next batch; the background schedule
+  covers them either way. Paused domains are skipped and reported.
+- **`/remove <category>`** stops a whole category. Because it destroys every
+  domain under it along with their assets, scans and findings, it replies with a
+  member list and a confirm token — `/remove <category> <token>` performs the
+  deletion. Confirmations are per-chat, expire after 10 minutes, and cannot be
+  replayed. An empty category is dropped immediately, and `/remove <domain>`
+  is unchanged.
+
 ## v4.0.0-free — scope-exclude model, chunked scanning, Telegram-only alerts
 
 Breaking change from the 3.x line:

@@ -46,6 +46,21 @@ function mapScopeState(scopeStatus: string): string {
   return "unknown";
 }
 
+/**
+ * The `created_at` / `updated_at` pair carried by every asset-family table
+ * except `dns_records` (which has `created_at` only — see migrations/0002).
+ *
+ * These columns are NOT NULL with no default, so an INSERT that omits them
+ * fails the whole statement — and because the asset discovery phase upserts
+ * them one asset at a time, that failure aborts the entire /scan pass and
+ * reports it as a failed scan. Every INSERT must bind the columns its table
+ * actually declares; test/assets-schema.test.ts runs these upserts against the
+ * real migrations so a drift here fails the build instead of production.
+ */
+function assetTimestamps(now: string): [string, string] {
+  return [now, now];
+}
+
 export async function upsertAsset(
   db: D1Database,
   targetId: string,
@@ -125,8 +140,8 @@ export async function upsertDnsRecord(
   const id = randomId("dns", 12);
   const fingerprint = Buffer.from(`${type}|${name}|${value}`).toString("base64url");
   await db
-    .prepare(`INSERT INTO dns_records (id, organization_id, target_id, asset_id, hostname, record_type, value, ttl, first_seen, last_seen, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, c.organizationId, c.targetId, c.assetId, name, type, value, ttl, now, now, fingerprint)
+    .prepare(`INSERT INTO dns_records (id, organization_id, target_id, asset_id, hostname, record_type, value, ttl, first_seen, last_seen, fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, c.organizationId, c.targetId, c.assetId, name, type, value, ttl, now, now, fingerprint, now)
     .run();
   return { id, created: true };
 }
@@ -154,9 +169,10 @@ export async function upsertCertificate(
     return { id: existing.id, created: false };
   }
   const id = randomId("cert", 12);
+  const [createdAt, updatedAt] = assetTimestamps(now);
   await db
-    .prepare(`INSERT INTO certificates (id, organization_id, target_id, asset_id, source, serial_number, issuer_cn, not_before, not_after, dns_names, first_seen, last_seen) VALUES (?, ?, ?, ?, 'scan', ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, c.organizationId, c.targetId, c.assetId, serial, issuer, notBefore, notAfter, JSON.stringify(sans), now, now)
+    .prepare(`INSERT INTO certificates (id, organization_id, target_id, asset_id, source, serial_number, issuer_cn, not_before, not_after, dns_names, first_seen, last_seen, created_at, updated_at) VALUES (?, ?, ?, ?, 'scan', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, c.organizationId, c.targetId, c.assetId, serial, issuer, notBefore, notAfter, JSON.stringify(sans), now, now, createdAt, updatedAt)
     .run();
   return { id, created: true };
 }
@@ -192,9 +208,10 @@ export async function upsertJavascriptFile(
     return { id: existing.id, created: false };
   }
   const id = randomId("js", 16);
+  const [createdAt, updatedAt] = assetTimestamps(now);
   await db
-    .prepare(`INSERT INTO javascript_files (id, organization_id, target_id, asset_id, url, url_canonical, hostname, content_hash, content_length, etag, last_modified, content_type, discovered_via, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scan', ?, ?)`)
-    .bind(id, c.organizationId, c.targetId, c.assetId, url, url, hostnameOf(url), sha256, sizeBytes, etag, lastModified, contentType, now, now)
+    .prepare(`INSERT INTO javascript_files (id, organization_id, target_id, asset_id, url, url_canonical, hostname, content_hash, content_length, etag, last_modified, content_type, discovered_via, first_seen, last_seen, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scan', ?, ?, ?, ?)`)
+    .bind(id, c.organizationId, c.targetId, c.assetId, url, url, hostnameOf(url), sha256, sizeBytes, etag, lastModified, contentType, now, now, createdAt, updatedAt)
     .run();
   return { id, created: true };
 }
@@ -221,9 +238,10 @@ export async function insertApiEndpoint(
     return { id: existing.id, inserted: false };
   }
   const id = randomId("api", 12);
+  const [createdAt, updatedAt] = assetTimestamps(now);
   await db
-    .prepare(`INSERT INTO api_endpoints (id, organization_id, target_id, asset_id, base_url, method, path, parameters, discovery_source, first_seen, last_seen) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)`)
-    .bind(id, c.organizationId, c.targetId, c.assetId, method, path, JSON.stringify(parameters), source, now, now)
+    .prepare(`INSERT INTO api_endpoints (id, organization_id, target_id, asset_id, base_url, method, path, parameters, discovery_source, first_seen, last_seen, created_at, updated_at) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, c.organizationId, c.targetId, c.assetId, method, path, JSON.stringify(parameters), source, now, now, createdAt, updatedAt)
     .run();
   return { id, inserted: true };
 }
@@ -256,7 +274,7 @@ export async function upsertService(
   serverHeader: string | null,
 ): Promise<ServiceUpsertResult> {
   const existing = await db
-    .prepare(`SELECT id, tls_json, banner_redacted, service_name FROM services WHERE asset_id = ? AND port = ? AND removed_at IS NULL`)
+    .prepare(`SELECT id, tls_json, banner_redacted, service_name FROM services WHERE asset_id = ? AND port = ? AND transport = ? AND removed_at IS NULL`)
     .bind(assetId, port, protocol)
     .first<{ id: string; tls_json: string; banner_redacted: string | null; service_name: string | null }>();
 

@@ -1,5 +1,7 @@
 # Watchtower
 
+![banner](./img/banner.jpg)
+
 A bug-bounty monitoring bot on Cloudflare Workers (**free tier**): it watches
 your public bug-bounty targets around the clock and sends a Telegram message
 for every **new** finding — new subdomains, live hosts, technologies, JavaScript
@@ -10,6 +12,39 @@ sensitive-path fuzz hits.
 > workflow, reports, integrations, REST API, emergency stop, runners and audit
 > logs are gone. The D1 schema is incompatible with previous versions — see
 > [DEPLOYMENT.md](./DEPLOYMENT.md#recreating-the-d1-database).
+
+## ⚠️ Read this before you run anything
+
+**This is an offensive-security tool.** It sends live HTTP requests to hosts you
+name, brute-forces DNS against a wordlist and fuzzes for exposed files and
+admin panels. That is reconnaissance against systems you do not own unless you
+have explicit, documented permission to test them.
+
+By using it you take responsibility for the following:
+
+- **Only monitor targets you are authorized to test.** Passive bug-bounty
+  programs (HackerOne, Bugcrowd, Intigriti, …) and written contracts are the
+  normal case. "It is on a CT log" and "it resolves in DNS" are *not*
+  authorization — a host being publicly reachable says nothing about whether
+  you may touch it.
+- **Stay inside the published scope** — and inside the exclusions you configure.
+  `/add example.com` means *every* subdomain of that domain is in scope, which
+  is frequently wider than the actual program scope. Read the program's rules
+  before adding a domain, and `/exclude` anything you must not touch.
+- **Respect rate limits and the program rules.** Defaults here are tuned for
+  Cloudflare's free tier, not for politeness. If a program forbids active
+  scanning, set `passive_only` and leave the active features off.
+- **Understand what the tool does not do.** It does not exploit, brute-force
+  credentials, or perform denial-of-service, and it never stores a found
+  credential value — but it does hit live hosts with real requests.
+- **You are responsible for your use.** The maintainer is not liable for
+  anything you do with this software, and running it against systems without
+  permission may violate the CFAA, the UK Computer Misuse Act, and equivalent
+  laws in most jurisdictions — regardless of intent or outcome.
+
+Scope enforcement is default-deny and enforced before every outbound request
+(see [SECURITY.md](./SECURITY.md)), but that is a safety net, not permission.
+When in doubt, don't add the target.
 
 ## What it does
 
@@ -38,8 +73,7 @@ Four capabilities, nothing else:
 ```
 /target_add shop           ← group your program's domains (optional)
 /add shop.example.com shop ← filing a domain under the category
-/target_info shop          ← every domain added for this category
-/scan shop.example.com     ← first results land in chat within seconds
+/scan shop                 ← scans the whole category; results in chat
 every 5 minutes forever    ← only NEW findings are reported from now on
 ```
 
@@ -52,10 +86,13 @@ every 5 minutes forever    ← only NEW findings are reported from now on
 - `/exclude` carves holes: a single subdomain (`sub.example.com`), a wildcard
   (`*.dev.example.com`) or a path (`example.com/excluded`). Excluded assets are
   never requested — the scope check runs before any network call.
-- `/scan <domain>` runs an initial scan immediately (summary + the urgent
-  high/critical alerts in chat), then monitoring continues on the 5-minute
-  cron. The baseline is recorded, so the cron only re-reports genuinely new
-  findings.
+- `/scan <category_or_domain>` runs a discovery pass immediately (summary + the
+  new-asset alerts in chat). CT logs and DNS records are third-party API calls
+  that answer in seconds, so they run inline; live-host probing, JavaScript,
+  CVE matching and wordlist fuzzing stay on the cron, where they are chunked to
+  fit the free tier — you get a message as each of those lands. Scanning a
+  category covers every domain filed under it, five per command.
+- The baseline is recorded, so the cron only re-reports genuinely new findings.
 - Everything is chunked: passive discovery is fast third-party API calls,
   while the slow phases (subdomain bruteforce, fuzz wordlists) advance a small
   slice per tick and keep their cursor in KV; HTTP probes rotate through
@@ -71,11 +108,13 @@ every 5 minutes forever    ← only NEW findings are reported from now on
 | `/target_info <name\|id>` | Every domain added under that category, with last scan / exclusions / feature count |
 | `/add <domain> [category]` | Start monitoring. Every subdomain is in scope immediately; optional 2nd arg files it under a category |
 | `/remove <domain>` | Stop monitoring and delete everything stored for the target |
+| `/remove <category>` | Stop a whole category — asks you to confirm with a token first, then deletes the category **and** every domain under it |
 | `/list` | Categories with their domains, then standalone domains — plus asset counts, last scan and exclusions |
 | `/exclude <domain> <value...>` | Skip a subdomain, `*.wildcard` or `domain/path` from scanning |
 | `/exclude list <domain>` | Show a target's exclusions |
 | `/exclude remove <domain> <value>` | Un-exclude |
-| `/scan <domain>` | Initial scan now (summary + urgent alerts in chat), then continuous monitoring |
+| `/scan <category>` | Scan a whole category now — the CT/DNS discovery pass runs inline for its domains, in batches of 5 |
+| `/scan <domain>` | Initial scan now (summary + new-asset alerts in chat), then continuous monitoring |
 | `/feature <domain>` | Status board of that target's monitoring features |
 | `/feature <domain> <key> <on\|off>` | Toggle one monitoring feature (see below) |
 | `/allow <telegram_id>` | Let another Telegram user talk to this bot |
@@ -157,6 +196,32 @@ Objects, no Queues (see `wrangler.toml` for the exact tunables).
 - Costs stay at $0/month: the exact free-tier footprint is documented in
   [DEPLOYMENT.md](./DEPLOYMENT.md).
 
+## Secrets and security
+
+**This repository contains no secrets.** All four credentials are placeholders,
+set out-of-band at deploy time:
+
+| Secret | Set with | Purpose |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | `wrangler secret put` | bot identity from [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_WEBHOOK_SECRET` | `wrangler secret put` | validates inbound `/telegram` (header or `?secret=`) |
+| `AUTHORIZED_TELEGRAM_IDS` | `wrangler secret put` | comma-separated bootstrap allowlist; extend with `/allow` |
+| `REDACTION_SALT` | `wrangler secret put` | salts secret fingerprints — generate with `openssl rand -hex 32` |
+
+- Never put a secret in `wrangler.toml`, in code, or in a committed file. Use
+  `wrangler secret put` (or `.dev.vars`, which is gitignored). Templates live in
+  [`.env.example`](./.env.example) and [`.dev.vars.example`](./.dev.vars.example).
+- `wrangler.toml` ships with empty `database_id` / `id` / `preview_id`. Fill
+  them with your own resource IDs after `wrangler d1 create` — the values
+  committed here are never anyone else's.
+- `scripts/webhook-tester.sh` reads the bot token from a shell variable; prefer
+  `wrangler secret put` over pasting a token into an interactive shell, which
+  persists it in shell history.
+- Detected secrets are never stored in full — only salted SHA-256 fingerprints
+  (`src/lib/redact.ts`). See [SECURITY.md](./SECURITY.md) for the full model and
+  [docs/incident-response.md](./docs/incident-response.md) for rotation steps if
+  something leaks.
+
 ## Development
 
 ```bash
@@ -173,6 +238,7 @@ Wordlists: `fuzz-wordlists/*.txt` are bundled as text modules (see the
 
 - [DEPLOYMENT.md](./DEPLOYMENT.md) — fresh deploy, D1 recreate, secrets, webhook
 - [SECURITY.md](./SECURITY.md) — access control, SSRF, redaction, responsible use
+- [LICENSE](./LICENSE) — Apache-2.0; no warranty, use at your own risk
 - [CHANGELOG.md](./CHANGELOG.md) — what changed across versions
 - [docs/architecture.md](./docs/architecture.md) — pipeline internals
 - [docs/threat-model.md](./docs/threat-model.md) — threats and mitigations

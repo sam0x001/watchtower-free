@@ -76,10 +76,10 @@ export const COMMANDS = [
   { command: "target_info", description: "Show a category and its domains: /target_info <category>" },
   { command: "add",     description: "Add a domain to monitor: /add <domain> [category]" },
   { command: "exclude", description: "Exclude a subdomain/path from scanning, e.g. /exclude sub.example.com" },
-  { command: "scan",    description: "Start an initial scan now, e.g. /scan example.com" },
+  { command: "scan",    description: "Scan a category or domain now, e.g. /scan shop" },
   { command: "feature", description: "List or toggle a domain's monitoring features: /feature <domain> [key on|off]" },
   { command: "list",    description: "List categories, domains, exclusions and asset counts" },
-  { command: "remove",  description: "Stop monitoring a domain, e.g. /remove example.com" },
+  { command: "remove",  description: "Stop a domain or a whole category, e.g. /remove example.com" },
   { command: "allow",   description: "Allow another Telegram user to use this bot: /allow <telegram_id>" },
   { command: "disallow", description: "Revoke a user's access: /disallow <telegram_id>" },
 ] as const;

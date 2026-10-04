@@ -83,6 +83,10 @@ async function savePortCursor(env: Env, targetId: string, index: number): Promis
 export interface ScanStats {
   /** Subdomains recorded for the first time during this pass. */
   subdomainsFound: number;
+  /** TLS certificates recorded for the first time during this pass. */
+  certsFound: number;
+  /** DNS records recorded for the first time during this pass. */
+  dnsRecordsFound: number;
   /** Hosts that answered an HTTP probe during this pass. */
   liveHosts: number;
   /** Technologies fingerprinted for the first time. */
@@ -129,6 +133,14 @@ export interface ScanRunResult {
 
 export interface ScanRunOptions {
   trigger?: ScanTrigger;
+  /**
+   * How much of the pipeline to run.
+   *   "passive" — certificate transparency + DNS records only. Third-party
+   *               API calls that answer in seconds, so this is what the inline
+   *               /scan path runs; everything else is left to the cron.
+   *   "full"    — the whole chunked pass (the default, used by the cron).
+   */
+  phases?: "passive" | "full";
   /** `scans.id` row to mirror the lifecycle onto. */
   scanId?: string | null;
   /** `job_queue.id` that caused this run (lock holder id + log correlation). */
@@ -144,12 +156,17 @@ export interface ScanRunOptions {
 /** Budget used by the inline /scan pass (the webhook must answer quickly). */
 export const INLINE_SCAN_BUDGET_MS = 40_000;
 
-/** Maximum high/critical alerts pushed inline by /scan (the rest ride the cron). */
-const INLINE_ALERT_LIMIT = 8;
+/**
+ * How many individual asset alerts /scan prints straight into the chat.
+ * Anything past this rides the notification queue instead, so nothing is
+ * silently dropped — see deliverInlineAlerts.
+ */
+const INLINE_ALERT_LIMIT = 12;
 
 function emptyStats(): ScanStats {
   return {
-    subdomainsFound: 0, liveHosts: 0, newTechs: 0, secretsFound: 0,
+    subdomainsFound: 0, certsFound: 0, dnsRecordsFound: 0, liveHosts: 0,
+    newTechs: 0, secretsFound: 0,
     cvesFound: 0, fuzzFindings: 0, fuzzRequests: 0, wildcardSkipped: 0,
     outOfScope: 0, hostsProbed: 0, portsProbed: 0, portsOpen: 0, bruteforce: null,
     topSubdomains: [], deadlineReached: false, errors: [],
@@ -271,6 +288,14 @@ function escapeHtml(value: string): string {
 
 function collectSubdomainStats(batch: Alert[], stats: ScanStats): void {
   for (const a of batch) {
+    if (a.type === "new_certificate") {
+      stats.certsFound++;
+      continue;
+    }
+    if (a.type === "new_dns_record") {
+      stats.dnsRecordsFound++;
+      continue;
+    }
     if (a.type !== "new_subdomain") continue;
     stats.subdomainsFound++;
     const value = String(a.metadata["asset_value"] ?? "");
@@ -297,6 +322,11 @@ export async function runScanForTarget(
   const stats = emptyStats();
   const alerts: Alert[] = [];
   const trigger: ScanTrigger = opts.trigger ?? "cron";
+  // "passive" stops after the CT/DNS phase: those are third-party API calls
+  // that answer in seconds, which is exactly what an interactive /scan wants.
+  // The heavy phases stay on the cron so the webhook invocation stays inside
+  // the Workers free-tier wall-clock + CPU budget.
+  const passiveOnly = (opts.phases ?? "full") === "passive";
 
   // ---- 1. Target + scope -------------------------------------------------
   const target = await getTargetById(env.DB, targetId);
@@ -331,7 +361,7 @@ export async function runScanForTarget(
   const pctx = providerCtx(env, logger);
 
   try {
-    logger.info("scan.start", { targetId, host, trigger, budgetMs, scopeEntries: scopeEntries.length });
+    logger.info("scan.start", { targetId, host, trigger, budgetMs, phases: opts.phases ?? "full", scopeEntries: scopeEntries.length });
 
     // ---- 3. Passive phase: certificate transparency + DNS records --------
     // A disabled subdomain_enum skips the CT/DoH providers entirely.
@@ -341,6 +371,17 @@ export async function runScanForTarget(
       stats.outOfScope += discovery.outOfScope;
       stats.errors.push(...discovery.errors);
       collectSubdomainStats(discovery.alerts, stats);
+    }
+
+    if (passiveOnly) {
+      logger.info("scan.passive_complete", {
+        targetId, host, trigger, alerts: alerts.length,
+        subdomains: stats.subdomainsFound,
+      });
+      return {
+        ok: true, retryable: true, targetId, targetName: target.name,
+        organizationId: target.organization_id, alerts, stats,
+      };
     }
 
     // ---- 4. Bruteforce phase: one bounded chunk of the wordlist ----------
@@ -810,10 +851,20 @@ export async function runPendingScans(
 /**
  * Run a scan right now (the /scan command) and report the results in chat.
  *
- * The operator gets: a "started" message, ONE summary, and the first few
- * high/critical alerts. Every alert is then baseline-recorded as already sent,
- * so the 5-minute cron keeps reporting only what is genuinely new after this
- * initial pass.
+ * Only the passive phase runs inline: certificate transparency + DNS records,
+ * which are third-party API calls that answer in seconds. The heavy phases
+ * (wordlist bruteforce, host probing, JavaScript analysis, CVE matching,
+ * wordlist fuzzing) stay on the cron — running them in the webhook invocation
+ * blows the Workers free-tier wall-clock and CPU budget, which is what used to
+ * leave /scan silent after its "started" message.
+ *
+ * Delivery contract for the alerts this pass produced:
+ *   * the first INLINE_ALERT_LIMIT are printed straight into the chat;
+ *   * every alert actually printed is baseline-recorded, so the cron does not
+ *     repeat it;
+ *   * anything NOT printed is enqueued as a notification job instead — it is
+ *     never marked as delivered without having been delivered. (Recording an
+ *     unsent alert as sent is what silently swallowed new subdomains before.)
  */
 export async function runInitialScanInline(env: Env, targetId: string, chatId: number): Promise<void> {
   const target = await getTargetById(env.DB, targetId);
@@ -822,27 +873,34 @@ export async function runInitialScanInline(env: Env, targetId: string, chatId: n
     return;
   }
 
-  const scanId = `scan_${crypto.randomUUID()}`;
-  const now = new Date().toISOString();
-  await env.DB
-    .prepare(
-      `INSERT INTO scans (id, organization_id, target_id, trigger, status, requested_by, started_at, created_at, updated_at)
-       VALUES (?, ?, ?, 'manual', 'running', ?, ?, ?, ?)`,
-    )
-    .bind(scanId, target.organization_id, targetId, String(chatId), now, now, now)
-    .run();
-
+  // Send before touching D1: a failed scan-row insert must never eat the
+  // acknowledgement, or the operator is left with a started-but-silent scan.
   await sendMessage(
     env, chatId,
-    `🟢 <b>Initial scan of ${escapeHtml(target.name)} started…</b>\n\n` +
-    `Certificate-transparency logs + DNS records, a chunk of the subdomain ` +
-    `wordlist, then live hosts, technologies, CVEs, JavaScript and sensitive-path ` +
-    `fuzzing. Heavy phases continue on the 5-minute schedule.`,
+    `🟢 <b>Scanning ${escapeHtml(target.name)}…</b>\n\n` +
+    `Querying certificate-transparency logs and DNS records now — results ` +
+    `below in a few seconds. Live hosts, technologies, CVEs, JavaScript and ` +
+    `sensitive-path fuzzing continue in the background and notify you as they land.`,
     { parseMode: "HTML" },
   );
 
+  const scanId = `scan_${crypto.randomUUID()}`;
+  const now = new Date().toISOString();
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO scans (id, organization_id, target_id, trigger, status, requested_by, started_at, created_at, updated_at)
+         VALUES (?, ?, ?, 'manual', 'running', ?, ?, ?, ?)`,
+      )
+      .bind(scanId, target.organization_id, targetId, String(chatId), now, now, now)
+      .run();
+  } catch (err) {
+    // The scan itself is still worth running — only the history row is lost.
+    log.warn("scan.inline_row_failed", { targetId, err: String(err) });
+  }
+
   const result = await runScanForTarget(env, targetId, {
-    trigger: "manual", scanId, deadlineMs: INLINE_SCAN_BUDGET_MS,
+    trigger: "manual", scanId, phases: "passive", deadlineMs: INLINE_SCAN_BUDGET_MS,
   });
 
   if (!result.ok) {
@@ -856,25 +914,111 @@ export async function runInitialScanInline(env: Env, targetId: string, chatId: n
 
   await updateScanRow(env.DB, scanId, "completed", {
     stats: result.stats,
-    stop_reason: result.stats.deadlineReached ? "deadline reached — continues on the next tick" : null,
+    stop_reason: "passive phase — full pass continues on the cron schedule",
   });
-  await sendMessage(env, chatId, summaryMessage(result), { parseMode: "HTML" });
+  await sendMessage(env, chatId, summaryMessage(result, true), { parseMode: "HTML" });
 
-  // Then the urgent findings, immediately (bounded so /scan can't spam the chat).
-  let inlineSent = 0;
-  for (const alert of result.alerts) {
-    if (await notificationAlreadySent(env.DB, alert.dedup_key)) continue;
+  const inlineSent = await deliverInlineAlerts(env, result, chatId);
 
-    if (inlineSent < INLINE_ALERT_LIMIT && (alert.severity === "high" || alert.severity === "critical")) {
-      inlineSent++;
-      await sendMessage(env, chatId, inlineAlertMessage(alert), { parseMode: "HTML" });
-    }
-    await recordNotificationSent(env.DB, alert, targetId, result.organizationId, `chat:${chatId}`);
-  }
+  // Hand the heavy phases to the next cron tick.
+  //
+  // A manual scan writes a `scans` row, and that row is exactly what
+  // `enqueueDueScans` throttles on — so without this the target would sit idle
+  // until the 30-minute rescan window reopened, even though the operator just
+  // asked for the work. Queueing it here means probing, JavaScript, CVE
+  // matching and fuzzing start within one tick and notify as they land.
+  await enqueueFollowUpFullScan(env, target, chatId);
 
   log.info("scan.inline_complete", {
     targetId, chatId, alerts: result.alerts.length, inlineSent,
   });
+}
+
+/**
+ * Queue a full scan pass for the next cron tick after an inline /scan.
+ *
+ * Priority 2 puts it ahead of the cron-generated priority-1 rescan jobs, so the
+ * operator's own request is the first thing the next tick picks up.
+ */
+async function enqueueFollowUpFullScan(
+  env: Env,
+  target: { id: string; name: string; organization_id: string },
+  chatId: number,
+): Promise<void> {
+  const scanId = `scan_${crypto.randomUUID()}`;
+  const stamp = new Date().toISOString();
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO scans (id, organization_id, target_id, trigger, status, requested_by, created_at, updated_at)
+         VALUES (?, ?, ?, 'continuation', 'queued', ?, ?, ?)`,
+      )
+      .bind(scanId, target.organization_id, target.id, String(chatId), stamp, stamp)
+      .run();
+
+    await enqueueJob(env.DB, "scan", {
+      job_id: scanId,
+      scan_id: scanId,
+      target_id: target.id,
+      target_name: target.name,
+      organization_id: target.organization_id,
+      profile: "full",
+      triggered_by: "continuation",
+      triggered_by_user_id: String(chatId),
+      enqueued_at: stamp,
+    }, { priority: 2, dedup_key: `scan_followup:${target.id}:${scanId}` });
+  } catch (err) {
+    // The inline results are already delivered; the background pass is a
+    // bonus, and the normal 30-minute rescan still covers the target.
+    log.warn("scan.followup_failed", { targetId: target.id, err: String(err) });
+  }
+}
+
+/**
+ * Print the first INLINE_ALERT_LIMIT alerts into the chat, baseline the ones
+ * actually delivered, and enqueue everything past the limit. Returns how many
+ * were printed.
+ *
+ * Exported for tests: the regression this guards is silent — a delivery bug
+ * here loses findings without any error surfacing anywhere.
+ *
+ * The already-sent lookup runs only over the candidates we would actually
+ * print — a popular domain's CT pass can return hundreds of names, and one D1
+ * read per name would dominate the webhook invocation. The overflow needs no
+ * pre-check: enqueueJob dedupes on dedup_key and the dispatcher re-checks the
+ * notifications table before sending, so it can never double-report.
+ */
+export async function deliverInlineAlerts(env: Env, result: ScanRunResult, chatId: number): Promise<number> {
+  if (result.alerts.length === 0) return 0;
+
+  // High/critical first — if the limit cuts the list short, the urgent findings
+  // are the ones that survive it.
+  const ranked = [...result.alerts].sort((a, b) => severityRank(b.severity) - severityRank(a.severity));
+  const candidates = ranked.slice(0, INLINE_ALERT_LIMIT);
+  const overflow = ranked.slice(INLINE_ALERT_LIMIT);
+
+  let delivered = 0;
+  for (const alert of candidates) {
+    if (await notificationAlreadySent(env.DB, alert.dedup_key)) continue;
+    await sendMessage(env, chatId, inlineAlertMessage(alert), { parseMode: "HTML" });
+    await recordNotificationSent(env.DB, alert, result.targetId, result.organizationId, `chat:${chatId}`);
+    delivered++;
+  }
+
+  // The overflow is NOT marked as sent — it rides the queue to the same chat.
+  if (overflow.length > 0) {
+    await enqueueAlertNotifications(env, { ...result, alerts: overflow });
+  }
+
+  return delivered;
+}
+
+const SEVERITY_RANK: Record<string, number> = {
+  critical: 4, high: 3, medium: 2, low: 1, informational: 0,
+};
+
+function severityRank(severity: string): number {
+  return SEVERITY_RANK[severity] ?? 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -889,19 +1033,37 @@ const INLINE_SEVERITY_EMOJI: Record<string, string> = {
   informational: "📌",
 };
 
-function summaryMessage(result: ScanRunResult): string {
+/**
+ * Render the end-of-pass summary.
+ *
+ * `passiveOnly` is passed explicitly rather than inferred from the counters: a
+ * full pass that hit its wall-clock deadline before probing anything would
+ * otherwise render as a discovery pass and hide the fact that it was cut short.
+ */
+function summaryMessage(result: ScanRunResult, passiveOnly: boolean): string {
   const s = result.stats;
-  const lines = [
-    `✅ <b>Initial scan finished — ${escapeHtml(result.targetName)}</b>`,
-    "",
-    `🌐 New subdomains: <b>${s.subdomainsFound}</b>`,
-    `🖥 Live hosts probed: <b>${s.liveHosts}</b> / ${s.hostsProbed}`,
-    `🔌 Ports: <b>${s.portsOpen}</b> open / ${s.portsProbed} probed this pass`,
-    `🧬 New technologies: <b>${s.newTechs}</b>`,
-    `🛡 CVE matches: <b>${s.cvesFound}</b>`,
-    `🔑 Secret candidates: <b>${s.secretsFound}</b>`,
-    `🧪 Fuzz findings: <b>${s.fuzzFindings}</b> (${s.fuzzRequests} requests)`,
-  ];
+
+  // A passive-only run reports the CT/DNS phase on its own; printing rows of
+  // zeros for probes/tech/CVEs/fuzzing would read like a failed scan.
+  const lines = passiveOnly
+    ? [
+      `✅ <b>Discovery pass finished — ${escapeHtml(result.targetName)}</b>`,
+      "",
+      `🌐 New subdomains: <b>${s.subdomainsFound}</b>`,
+      `🗜 Certificates and DNS records: <b>${s.certsFound}</b> new certs · <b>${s.dnsRecordsFound}</b> new records`,
+      `🚫 Out-of-scope results ignored: <b>${s.outOfScope}</b>`,
+    ]
+    : [
+      `✅ <b>Scan pass finished — ${escapeHtml(result.targetName)}</b>`,
+      "",
+      `🌐 New subdomains: <b>${s.subdomainsFound}</b>`,
+      `🖥 Live hosts probed: <b>${s.liveHosts}</b> / ${s.hostsProbed}`,
+      `🔌 Ports: <b>${s.portsOpen}</b> open / ${s.portsProbed} probed this pass`,
+      `🧬 New technologies: <b>${s.newTechs}</b>`,
+      `🛡 CVE matches: <b>${s.cvesFound}</b>`,
+      `🔑 Secret candidates: <b>${s.secretsFound}</b>`,
+      `🧪 Fuzz findings: <b>${s.fuzzFindings}</b> (${s.fuzzRequests} requests)`,
+    ];
 
   if (s.bruteforce) {
     lines.push(
@@ -918,7 +1080,20 @@ function summaryMessage(result: ScanRunResult): string {
     for (const host of s.topSubdomains) lines.push(`• <code>${escapeHtml(host)}</code>`);
   }
 
-  if (s.deadlineReached) {
+  if (s.errors.length > 0) {
+    lines.push("", "<b>⚠️ Provider issues</b>");
+    for (const err of [...new Set(s.errors)].slice(0, 5)) {
+      lines.push(`• ${escapeHtml(err.slice(0, 200))}`);
+    }
+  }
+
+  if (passiveOnly) {
+    lines.push(
+      "",
+      "<i>Live hosts, technologies, CVEs, JavaScript and sensitive-path " +
+      "fuzzing run in the background — you get a message for each new one.</i>",
+    );
+  } else if (s.deadlineReached) {
     lines.push("", "<i>Time budget reached — probes, JavaScript and fuzzing continue on the next tick.</i>");
   }
 

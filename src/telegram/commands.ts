@@ -20,6 +20,7 @@ import {
   listScopeEntries,
   createTarget,
   deleteTarget,
+  deleteTargetGroup,
   insertScopeEntry,
   removeScopeEntry,
   addAllowedUser,
@@ -30,6 +31,15 @@ import {
   listTargetsByGroup,
   setTargetGroup,
 } from "../db/queries/targets.js";
+import {
+  SCAN_GROUP_BATCH,
+  clearRemoveConfirmation,
+  clearScanContinuation,
+  readRemoveConfirmation,
+  readScanContinuation,
+  saveRemoveConfirmation,
+  saveScanContinuation,
+} from "./pending.js";
 import { FEATURES, FEATURE_KEYS, getFeatureMap, setFeature, type FeatureKey } from "../db/queries/features.js";
 import { loadTargetOverview, countEnabled } from "../db/queries/groups-view.js";
 
@@ -74,6 +84,92 @@ function escapeHtml(value: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/**
+ * Delete a category and every domain filed under it, returning how many
+ * domains were destroyed.
+ *
+ * Each member is deleted through `deleteTarget` (the same path as /remove on a
+ * single domain) so all their scopes/assets/scans/findings cascade exactly as
+ * they would one at a time, then the now-empty category row goes too.
+ *
+ * Exported for tests: this is the destructive half of /remove <category>.
+ */
+export async function deleteGroupAndMembers(env: Env, groupId: string): Promise<number> {
+  const members = await listTargetsByGroup(env.DB, groupId);
+  let deleted = 0;
+  for (const member of members) {
+    await deleteTarget(env.DB, member.id);
+    deleted++;
+  }
+  await deleteTargetGroup(env.DB, groupId);
+  return deleted;
+}
+
+/**
+ * `/scan <category>` — run the inline discovery pass for the category's member
+ * domains, one bounded batch at a time.
+ *
+ * Each member costs several third-party CT/DNS calls, so at most
+ * SCAN_GROUP_BATCH run inline per command; the remainder is reported with a
+ * token to continue. Every domain scanned here is also picked up by the normal
+ * cron schedule, so continuation is a convenience, not a requirement.
+ */
+async function scanGroup(env: Env, ctx: CommandContext, group: { id: string; name: string }): Promise<void> {
+  const members = await listTargetsByGroup(env.DB, group.id);
+  if (members.length === 0) {
+    await sendMessage(env, ctx.chatId,
+      `📂 <b>${escapeHtml(group.name)}</b> has no domains yet.\n` +
+      `Add one with <code>/add example.com ${escapeHtml(group.name)}</code>.`,
+      { parseMode: "HTML" });
+    return;
+  }
+
+  // A second `/scan <category>` continues where the first left off.
+  const previous = await readScanContinuation(env, ctx.chatId, group.id);
+  const paused = members.filter((m) => m.paused);
+  const queue = (previous?.pending
+    ? members.filter((m) => previous.pending.includes(m.id))
+    : members).filter((m) => !m.paused);
+
+  if (queue.length === 0) {
+    await clearScanContinuation(env, ctx.chatId);
+    await sendMessage(env, ctx.chatId,
+      `✅ <b>${escapeHtml(group.name)}</b> — all ${members.length} domain${members.length === 1 ? "" : "s"} scanned.` +
+      (paused.length > 0 ? `\n<i>${paused.length} paused domain${paused.length === 1 ? "" : "s"} skipped.</i>` : ""),
+      { parseMode: "HTML" });
+    return;
+  }
+
+  const batch = queue.slice(0, SCAN_GROUP_BATCH);
+  const rest = queue.slice(SCAN_GROUP_BATCH);
+
+  // Bounded concurrency: each member's CT/DNS providers are third-party HTTP
+  // calls, so running the batch in parallel keeps the whole category inside
+  // the webhook's wall-clock budget. runInitialScanInline never throws (it
+  // reports failures into the chat), so one bad domain can't abort the batch.
+  await Promise.all(batch.map((member) => runInitialScanInline(env, member.id, ctx.chatId)));
+
+  if (rest.length > 0) {
+    await saveScanContinuation(env, ctx.chatId, {
+      groupId: group.id, groupName: group.name,
+      pending: rest.map((m) => m.id), scanned: (previous?.scanned ?? 0) + batch.length,
+      createdAt: new Date().toISOString(),
+    });
+    await sendMessage(env, ctx.chatId,
+      `📂 <b>${escapeHtml(group.name)}</b>: scanned ${batch.length} of ${queue.length + (previous?.scanned ?? 0)} domains so far. ` +
+      `<b>${rest.length}</b> left — send <code>/scan ${escapeHtml(group.name)}</code> again to continue. ` +
+      `(They are also covered by the background schedule.)`,
+      { parseMode: "HTML" });
+  } else {
+    await clearScanContinuation(env, ctx.chatId);
+    const done = (previous?.scanned ?? 0) + batch.length;
+    await sendMessage(env, ctx.chatId,
+      `✅ <b>${escapeHtml(group.name)}</b> — ${done} domain${done === 1 ? "" : "s"} scanned.` +
+      (paused.length > 0 ? `\n<i>${paused.length} paused domain${paused.length === 1 ? "" : "s"} skipped.</i>` : ""),
+      { parseMode: "HTML" });
+  }
 }
 
 export async function handleCommand(env: Env, ctx: CommandContext): Promise<void> {
@@ -257,9 +353,70 @@ const handlers: Record<string, CommandHandler> = {
   },
 
   remove: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /remove <domain>"); return; }
-    const target = await getTargetByNameOrId(env.DB, args[0]!);
-    if (!target) { await sendMessage(env, ctx.chatId, `Target ${args[0]} not found.`); return; }
+    if (args.length < 1) {
+      await sendMessage(env, ctx.chatId,
+        "Usage:\n" +
+        "/remove <domain> — stop monitoring one domain\n" +
+        "/remove <category> — stop a whole category (asks to confirm first)");
+      return;
+    }
+    const ref = args[0]!;
+
+    // ---- Confirmation step for a previously-offered category deletion ----
+    if (args.length >= 2) {
+      const token = args[1]!;
+      const pending = await readRemoveConfirmation(env, ctx.chatId, token);
+      if (!pending) {
+        await sendMessage(env, ctx.chatId,
+          "⚠️ That confirmation is invalid or expired (confirmations last 10 minutes).\n" +
+          "Run <code>/remove &lt;category&gt;</code> again to get a fresh one.");
+        return;
+      }
+      const deleted = await deleteGroupAndMembers(env, pending.groupId);
+      await clearRemoveConfirmation(env, ctx.chatId);
+      await sendMessage(env, ctx.chatId,
+        `🗑 <b>Category ${escapeHtml(pending.groupName)}</b> and <b>${deleted}</b> ` +
+        `domain${deleted === 1 ? "" : "s"} deleted. Monitoring and all stored ` +
+        `findings for ${deleted === 1 ? "it" : "them"} were removed.`,
+        { parseMode: "HTML" });
+      return;
+    }
+
+    // ---- A category name/id: confirm before destroying its domains ------
+    const group = await getTargetGroupByNameOrId(env.DB, ref);
+    if (group) {
+      const members = await listTargetsByGroup(env.DB, group.id);
+      if (members.length === 0) {
+        // Nothing to destroy — just drop the empty category.
+        await deleteTargetGroup(env.DB, group.id);
+        await sendMessage(env, ctx.chatId,
+          `🗑 Empty category <b>${escapeHtml(group.name)}</b> removed.`, { parseMode: "HTML" });
+        return;
+      }
+      const token = await saveRemoveConfirmation(env, ctx.chatId, {
+        groupId: group.id, groupName: group.name,
+        domainCount: members.length, createdAt: new Date().toISOString(),
+      });
+      const memberList = members.slice(0, 10).map((m) => `• <code>${escapeHtml(m.name)}</code>`).join("\n");
+      const more = members.length > 10 ? `\n<i>…and ${members.length - 10} more</i>` : "";
+      await sendMessage(env, ctx.chatId,
+        `⚠️ <b>Remove category ${escapeHtml(group.name)}?</b>\n\n` +
+        `This deletes the category AND all <b>${members.length}</b> domain${members.length === 1 ? "" : "s"} ` +
+        `under it, together with every stored asset, scan and finding:\n` +
+        `${memberList}${more}\n\n` +
+        `To confirm, send:\n<code>/remove ${escapeHtml(group.name)} ${escapeHtml(token)}</code>\n\n` +
+        `<i>Or /remove ${escapeHtml(members[0]!.name)} to delete just one domain and keep the category.</i>`,
+        { parseMode: "HTML" });
+      return;
+    }
+
+    // ---- A plain domain ----
+    const target = await getTargetByNameOrId(env.DB, ref);
+    if (!target) {
+      await sendMessage(env, ctx.chatId,
+        `Neither a category nor a domain named <code>${escapeHtml(ref)}</code> was found.`);
+      return;
+    }
     await deleteTarget(env.DB, target.id);
     await sendMessage(env, ctx.chatId, `🗑 ${target.name} removed. Monitoring and all its stored findings were deleted.`);
   },
@@ -381,19 +538,23 @@ const handlers: Record<string, CommandHandler> = {
   },
 
   scan: async (env, ctx, args) => {
-    if (args.length < 1) { await sendMessage(env, ctx.chatId, "Usage: /scan <domain>"); return; }
+    if (args.length < 1) {
+      await sendMessage(env, ctx.chatId,
+        "Usage: /scan <category_or_domain>\n" +
+        "Scanning a category scans every domain filed under it.\n" +
+        "Example: /scan shop");
+      return;
+    }
+    // A category name or id scans every member domain; a domain name or id
+    // scans just that one. Categories are checked first — their names live in
+    // their own namespace, and every member must be covered.
+    const group = await getTargetGroupByNameOrId(env.DB, args[0]!);
+    if (group) {
+      await scanGroup(env, ctx, group);
+      return;
+    }
     const target = await getTargetByNameOrId(env.DB, args[0]!);
     if (!target) {
-      const group = await getTargetGroupByNameOrId(env.DB, args[0]!);
-      if (group) {
-        const members = await listTargetsByGroup(env.DB, group.id);
-        const memberLines = members.map((m) => `• <code>/scan ${escapeHtml(m.name)}</code>`);
-        await sendMessage(env, ctx.chatId,
-          `📂 <b>${escapeHtml(group.name)}</b> is a category — scans run per domain:\n` +
-          (memberLines.length > 0 ? memberLines.join("\n") : "(no domains yet)"),
-          { parseMode: "HTML" });
-        return;
-      }
       await sendMessage(env, ctx.chatId, `Target ${args[0]} not found. Add it first with /add ${args[0]}.`);
       return;
     }
